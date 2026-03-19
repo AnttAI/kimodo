@@ -11,6 +11,7 @@ import viser.transforms as tf
 from kimodo.skeleton import (
     G1Skeleton34,
     SOMASkeleton30,
+    SOMASkeleton77,
     batch_rigid_transform,
     global_rots_to_local_rots,
 )
@@ -458,6 +459,18 @@ class CharacterMotion:
                 "right_hand_roll_skel",
                 "left_toe_base",
                 "right_toe_base",
+            }
+        elif isinstance(self.skeleton, SOMASkeleton77):
+            skel30_names = {name for name, _ in SOMASkeleton30.bone_order_names_with_parents}
+            hidden_gizmo_joints = {name for name in self.skeleton.bone_order_names if name not in skel30_names}
+            hidden_gizmo_joints |= {
+                "RightHandThumbEnd",
+                "RightHandMiddleEnd",
+                "LeftHandThumbEnd",
+                "LeftHandMiddleEnd",
+                "LeftEye",
+                "RightEye",
+                "Jaw",
             }
         elif isinstance(self.skeleton, SOMASkeleton30):
             hidden_gizmo_joints = {

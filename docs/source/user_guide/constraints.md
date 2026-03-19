@@ -13,8 +13,14 @@ It is easiest to look at the examples provided with the demo to see how thse are
     - `root2d`, `fullbody`, `left-hand`, `right-hand`, `left-foot`, `right-foot`, `end-effector`
   - `frame_indices` (array of integers): 0-based frame indices within the generated clip.
 
+
+```{note}
+For SOMA models, constraints may be authored or displayed on the full `somaskel77` skeleton, but Kimodo converts them to the reduced `somaskel30` representation before passing them to the model. See the [skeleton](../key_concepts/skeleton.md) section for more details.
+```
+
 ## Constraint Types
 Depending on `type`, additional fields are required or optional. All numeric arrays are plain nested JSON lists. In the following definitions `T` is the number of frames and `J` is the number of skeleton joints.
+
 
 ### `root2d`
 This captures 2D root waypoints and 2D root paths. It requires:

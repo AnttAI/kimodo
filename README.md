@@ -94,6 +94,7 @@ Motions can also be generated directly from the command line with the `kimodo_ge
 - `--num_samples`: Number of motion variations to generate
 - `--constraints`: Constraint file to control the generated motion (e.g., saved from the web demo)
 - `--diffusion_steps`: Number of denoising steps
+- `--cfg_type` / `--cfg_weight`: Classifier-free guidance (`nocfg`, `regular` with one weight, or `separated` with two weights for text vs. constraints); see the [CLI docs](https://research.nvidia.com/labs/sil/projects/kimodo/docs/user_guide/cli.html#classifier-free-guidance-cfg)
 - `--no-postprocess`: Flag to disable foot skate and constraint cleanup post-processing
 - `--seed`: Random seed for reproducible results
 

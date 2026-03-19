@@ -13,6 +13,7 @@ from kimodo.constraints import FullBodyConstraintSet
 from kimodo.motion_rep.feature_utils import compute_heading_angle, length_to_mask
 from kimodo.postprocess import post_process_motion
 from kimodo.sanitize import sanitize_texts
+from kimodo.skeleton import SOMASkeleton30
 from kimodo.tools import to_numpy
 
 from .cfg import ClassifierFreeGuidedModel
@@ -55,6 +56,13 @@ class Kimodo(nn.Module):
         # for classifier-free guidance
 
         self.to(device)
+
+    @property
+    def output_skeleton(self):
+        """Skeleton used for model output (somaskel77 for SOMA, else unchanged)."""
+        if isinstance(self.skeleton, SOMASkeleton30):
+            return self.skeleton.somaskel77
+        return self.skeleton
 
     def train(self, mode: bool):
         self.denoiser.train(mode)
@@ -323,6 +331,10 @@ class Kimodo(nn.Module):
             )
             output.update(corrected)
 
+        # Convert SOMA output to somaskel77 for external API
+        if isinstance(self.skeleton, SOMASkeleton30):
+            output = self.skeleton.output_to_SOMASkeleton77(output)
+
         # Convert to numpy if requested
         if return_numpy:
             output = to_numpy(output)
@@ -508,6 +520,10 @@ class Kimodo(nn.Module):
             )
             # key frame outputs / foot contacts are not changed
             output.update(corrected)
+
+        # Convert SOMA output to somaskel77 for external API
+        if isinstance(self.skeleton, SOMASkeleton30):
+            output = self.skeleton.output_to_SOMASkeleton77(output)
 
         # Convert to numpy if requested
         if return_numpy:

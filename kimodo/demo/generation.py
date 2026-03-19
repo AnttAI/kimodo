@@ -14,7 +14,7 @@ from kimodo.constraints import (
     Root2DConstraintSet,
 )
 from kimodo.exports.mujoco import apply_g1_real_robot_projection
-from kimodo.skeleton import G1Skeleton34
+from kimodo.skeleton import G1Skeleton34, SOMASkeleton30
 from kimodo.tools import seed_everything
 
 from .embedding_cache import CachedTextEncoder
@@ -23,6 +23,7 @@ from .state import ClientSession, ModelBundle
 
 def compute_model_constraints_lst(
     session: ClientSession,
+    model_bundle: ModelBundle,
     num_frames: int,
     device: str,
 ):
@@ -30,6 +31,11 @@ def compute_model_constraints_lst(
     assert len(session.motions) == 1, "Only one motion allowed for constrained generation"
     if not session.constraints:
         return []
+
+    model_skeleton = model_bundle.model.skeleton
+    # For SOMA, UI uses somaskel77; extract 30-joint subset for the model
+    use_skel_slice = isinstance(model_skeleton, SOMASkeleton30) and session.skeleton.nbjoints != model_skeleton.nbjoints
+    skel_slice = model_skeleton.get_skel_slice(session.skeleton) if use_skel_slice else None
 
     dense_smooth_root_pos_2d = None
     if session.constraints["2D Root"].dense_path:
@@ -56,7 +62,7 @@ def compute_model_constraints_lst(
             # same as "smooth_root_2d"
             model_constraints.append(
                 Root2DConstraintSet(
-                    session.skeleton,
+                    model_skeleton,
                     frame_indices,
                     smooth_root_pos_2d,
                 )
@@ -64,6 +70,9 @@ def compute_model_constraints_lst(
         elif track_name == "Full-Body":
             constraint_joints_pos = constraint_info["joints_pos"][valid_idx].to(device)
             constraint_joints_rot = constraint_info["joints_rot"][valid_idx].to(device)
+            if skel_slice is not None:
+                constraint_joints_pos = constraint_joints_pos[:, skel_slice]
+                constraint_joints_rot = constraint_joints_rot[:, skel_slice]
 
             smooth_root_pos_2d = None
             if dense_smooth_root_pos_2d is not None:
@@ -71,7 +80,7 @@ def compute_model_constraints_lst(
 
             model_constraints.append(
                 FullBodyConstraintSet(
-                    session.skeleton,
+                    model_skeleton,
                     frame_indices,
                     constraint_joints_pos,
                     constraint_joints_rot,
@@ -81,6 +90,9 @@ def compute_model_constraints_lst(
         elif track_name == "End-Effectors":
             constraint_joints_pos = constraint_info["joints_pos"][valid_idx].to(device)
             constraint_joints_rot = constraint_info["joints_rot"][valid_idx].to(device)
+            if skel_slice is not None:
+                constraint_joints_pos = constraint_joints_pos[:, skel_slice]
+                constraint_joints_rot = constraint_joints_rot[:, skel_slice]
 
             end_effector_type_set_lst = [
                 end_effector_type_set
@@ -105,7 +117,7 @@ def compute_model_constraints_lst(
 
                 model_constraints.append(
                     cls(
-                        session.skeleton,
+                        model_skeleton,
                         frame_indices_cls,
                         constraint_joints_pos_el,
                         constraint_joints_rot_el,
@@ -143,7 +155,7 @@ def generate(
 
     seed_everything(seed)
 
-    model_constraints = compute_model_constraints_lst(session, sum(num_frames), device)
+    model_constraints = compute_model_constraints_lst(session, model_bundle, sum(num_frames), device)
     cfg_weight = cfg_weight or [2.0, 2.0]
     postprocess_parameters = postprocess_parameters or {}
     transitions_parameters = transitions_parameters or {}

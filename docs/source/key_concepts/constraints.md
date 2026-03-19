@@ -29,6 +29,11 @@ Kimodo is trained to excel at specific types of constraints.
 
 **Foot contacts**: toe/heel contact patterns. While the model is trained to support this, it is not currently implemented in the demo UI or Python API.
 
+
+```{note}
+For SOMA models, constraints may be authored or displayed on the full `somaskel77` skeleton, but Kimodo converts them to the reduced `somaskel30` representation before passing them to the model. See the [skeleton](./skeleton.md) section for more details.
+```
+
 ## Time and Scope
 
 In our CLI and demo, constraints can be defined at:

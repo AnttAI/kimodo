@@ -27,6 +27,7 @@ extensions = [
     "sphinx.ext.githubpages",
     "sphinx_copybutton",
     "myst_parser",
+    "sphinx_design",
 ]
 
 napoleon_google_docstring = True
@@ -188,6 +189,9 @@ copybutton_prompt_is_regexp = True
 
 # Generate heading anchors so cross-doc links like path.md#fragment resolve (local ids).
 myst_heading_anchors = 4
+
+# Required so `:::{dropdown}` and other fenced directives in .md files are parsed (not shown as plain text).
+myst_enable_extensions = ["colon_fence"]
 
 
 def setup(app):

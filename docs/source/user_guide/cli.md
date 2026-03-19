@@ -61,6 +61,52 @@ To see all available flags, run `kimodo_gen --help`. They are:
 - `--seed`: Seed for reproducible results
 - `--no-postprocess`: Disable post-processing (includes foot skate cleanup and constraint optimization)
 - `--input_folder`: Folder containing meta.json and optional constraints.json. If set, generation settings are loaded from meta.json. These are found in demo example folders.
+- `--cfg_type`: Classifier-free guidance mode: `nocfg`, `regular`, or `separated` (the custom mode with independent text and constraint scales). See {ref}`Classifier-free guidance (details) <classifier-free-guidance-cfg>` below.
+- `--cfg_weight`: One float for `regular` CFG, or two floats `[text_weight, constraint_weight]` for `separated` CFG. If you pass only weights (no `--cfg_type`), one value implies `regular` and two imply `separated`. Not used with `nocfg`.
+
+:::{dropdown} Classifier-free guidance (CFG)
+:name: classifier-free-guidance-cfg
+
+The CLI mirrors the Python API in [Generation parameters](configuration.md): Kimodo supports standard CFG (`regular`) and a **separated** variant with two scales—text vs. constraints—which is the usual setting in this project.
+
+**Rules:**
+
+- `nocfg`: no weights; do not pass `--cfg_weight`.
+- `regular`: pass exactly one value after `--cfg_weight`.
+- `separated`: pass exactly two values after `--cfg_weight`.
+
+If you pass **`--cfg_type` or `--cfg_weight` on the command line**, those values override any `cfg` block in `meta.json` when using `--input_folder`. If you omit both flags, `meta.json` may still supply CFG via `cfg.enabled`, `cfg.text_weight`, and `cfg.constraint_weight` (same shape as the interactive demo examples). If there is no CLI CFG and no `cfg` in meta, the model uses its built-in defaults.
+
+Examples:
+
+```bash
+# No classifier-free guidance
+kimodo_gen "A person walks." --cfg_type nocfg
+
+# Standard CFG (single scale)
+kimodo_gen "A person walks." --cfg_type regular --cfg_weight 2.5
+
+# Separated CFG (text scale, then constraint scale)
+kimodo_gen "A person walks." --cfg_type separated --cfg_weight 2.0 1.5
+
+# Infer mode from arity: one float -> regular; two floats -> separated
+kimodo_gen "A person walks." --cfg_weight 2.0 2.0
+```
+
+:::
 
 ## Python API
 The `kimodo/scripts/generate.py` script is a good place to start to familiarize yourself with the Python API of Kimodo if you'd like to use this directly. The full model API is detailed in the [API documentation](../api_reference/index.rst).
+
+If you want to use kimodo in another project, you can interact with it like this:
+
+```python
+from kimodo import load_model
+
+model = load_model("kimodo-soma-rp", device="cuda")
+output = model(
+    prompt="A person jumps",
+    num_frames=150,
+    num_denoising_steps=100,
+)
+```

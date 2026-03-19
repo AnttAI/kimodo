@@ -90,6 +90,7 @@ def motion_to_bvh(
 
     local_rot_mats = local_rot_mats.detach()
     root_positions = root_positions.detach()
+    # SOMA: accept either somaskel30 (convert to 77) or somaskel77 (use as-is)
     if skeleton.name == "somaskel30":
         local_rot_mats = skeleton.to_SOMASkeleton77(local_rot_mats)
         skeleton = skeleton.somaskel77
@@ -125,7 +126,7 @@ def motion_to_bvh(
     ]
     _JOINT_CHANNELS = ["Zrotation", "Yrotation", "Xrotation"]
 
-    # Scale from meters to centimeters (match original BVH scale for Blender).
+    # Scale from meters to centimeters (match original BVH scale).
     neutral = neutral * 100
     root_xyz = root_xyz * 100
 

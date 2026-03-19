@@ -9,6 +9,7 @@ kimodo/
 │   │   ├── backbone.py           # Transformer encoder backbone
 │   │   ├── diffusion.py          # Diffusion process
 │   │   ├── cfg.py                # Classifier-free guidance
+│   │   ├── common.py              # Shared model utilities
 │   │   ├── load_model.py         # Model loading and registry lookup
 │   │   ├── loading.py            # Checkpoint loading utilities
 │   │   ├── registry.py           # Model registry (skeleton, checkpoint URLs)
@@ -17,6 +18,7 @@ kimodo/
 │   │   └── llm2vec/              # LLM-based text encoder
 │   ├── motion_rep/               # Motion representation
 │   │   ├── reps/                 # Skeleton-specific motion reps
+│   │   │   ├── base.py           # Base motion rep types
 │   │   │   ├── kimodo_motionrep.py
 │   │   │   └── tmr_motionrep.py
 │   │   ├── conditioning.py      # Conditioning (text, constraints)
@@ -48,7 +50,9 @@ kimodo/
 │   │   ├── state.py              # Application state
 │   │   ├── ui.py                 # UI layout and callbacks
 │   │   ├── generation.py         # Generation pipeline for demo
-│   │   └── embedding_cache.py   # Cached text embeddings
+│   │   ├── embedding_cache.py   # Cached text embeddings
+│   │   ├── queue_manager.py      # Request queue for demo
+│   │   └── __main__.py           # Demo run as module
 │   ├── exports/                  # Motion export formats
 │   │   ├── bvh.py                # BVH export
 │   │   ├── mujoco.py             # MuJoCo export
@@ -61,9 +65,11 @@ kimodo/
 │   ├── scripts/                  # CLI and helper scripts
 │   │   ├── generate.py           # CLI for motion synthesis (kimodo_gen)
 │   │   ├── run_text_encoder_server.py  # Text encoder server (kimodo_textencoder)
-│   │   ├── generate_eval.py      # Evaluation generation
 │   │   ├── gradio_theme.py       # Gradio theme for demo
-│   │   └── ...                   # G1/SOMA asset scripts
+│   │   ├── docker-entrypoint.sh  # Docker entrypoint for demo
+│   │   ├── lock_requirements.py  # Dependency locking
+│   │   ├── mujoco_load.py        # MuJoCo scene loading
+│   │   └── ...                   # Other helpers
 │   ├── assets/                   # Package data (shipped with package)
 │   │   ├── demo/                 # Demo examples and config
 │   │   └── skeletons/            # Skeleton assets
@@ -82,6 +88,8 @@ kimodo/
 ├── assets/                       # Repo-level assets (banner, screenshots)
 ├── pyproject.toml                # Package config and entry points
 ├── setup.py                      # Setuptools entry (if needed)
+├── Dockerfile                    # Container image for demo
+├── docker-compose.yaml           # Docker Compose for demo + text encoder
 └── README.md
 ```
 

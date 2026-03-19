@@ -12,4 +12,8 @@ The Load/Save and Exports panels allow saving generated results and load in prev
 - **Exports**
     - **Screenshot**: save current canvas as an image that can be downloaded through your browser
     - **Video**: record the current motion to a video that can be download through your browser
-    - **Motion**: save the current motion to a format of your choice depending on the skeleton. This includes NPZ, BVH, CSV, and AMASS NPZ as discussed in [output formats](../user_guide/output_formats.md).
+    - **Motion**: save the current motion to a format of your choice depending on the loaded skeleton:
+      - SOMA: `NPZ` or `BVH`
+      - G1: `NPZ` or `CSV`
+      - SMPL-X: `NPZ` or `AMASS NPZ`
+      These formats are described in [output formats](../user_guide/output_formats.md).

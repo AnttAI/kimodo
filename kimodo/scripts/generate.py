@@ -3,6 +3,7 @@
 
 import argparse
 import os
+from typing import Any, Dict, Optional
 
 import numpy as np
 import torch
@@ -10,6 +11,7 @@ import torch
 from kimodo import DEFAULT_MODEL, load_model
 from kimodo.constraints import load_constraints_lst
 from kimodo.meta import load_prompts_from_meta
+from kimodo.model.cfg import CFG_TYPES
 from kimodo.model.registry import get_model_info
 from kimodo.tools import load_json, seed_everything
 
@@ -87,6 +89,27 @@ def parse_args():
         default=None,
         help="Folder containing meta.json and optional constraints.json. If set, generation settings are loaded from meta.json.",
     )
+    parser.add_argument(
+        "--cfg_type",
+        type=str,
+        default=argparse.SUPPRESS,
+        choices=CFG_TYPES,
+        help=(
+            "Classifier-free guidance mode: nocfg (no CFG), regular (single scale on cond vs uncond), "
+            "or separated (custom: separate text and constraint scales). "
+            "Use with --cfg_weight as required by the mode."
+        ),
+    )
+    parser.add_argument(
+        "--cfg_weight",
+        type=float,
+        nargs="*",
+        default=argparse.SUPPRESS,
+        help=(
+            "CFG scale(s): one float for regular, or two floats [text_weight, constraint_weight] for separated. "
+            "Omit with --cfg_type nocfg. If omitted, two floats alone imply separated; one float alone implies regular."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -112,7 +135,10 @@ def get_texts_and_num_frames_from_prompt(prompt: str, duration: str, fps: float)
 
 
 def _single_file_path(path: str, ext: str) -> str:
-    """Return path for a single output file (no folder). Adds ext if missing; creates parent dirs if any."""
+    """Return path for a single output file (no folder).
+
+    Adds ext if missing; creates parent dirs if any.
+    """
     if not path.endswith(ext):
         path = path.rstrip(os.sep) + ext
     parent = os.path.dirname(path)
@@ -123,6 +149,7 @@ def _single_file_path(path: str, ext: str) -> str:
 
 def _output_dir_and_path(path: str, default_base: str, ext: str):
     """Create output folder from path and return (dir_path, path_for_file_with_suffix, base_name).
+
     If path has an extension, folder name is the path stem; else the path is the folder name.
     base_name is the folder basename for _00, _01, ... when n_samples > 1.
     """
@@ -130,6 +157,68 @@ def _output_dir_and_path(path: str, default_base: str, ext: str):
     os.makedirs(folder, exist_ok=True)
     base_name = os.path.basename(folder.rstrip(os.sep))
     return folder, os.path.join(folder, default_base + ext), base_name
+
+
+def resolve_cfg_kwargs(args: argparse.Namespace, meta: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Resolve cfg_type / cfg_weight for model(...).
+
+    Precedence: explicit CLI (--cfg_type / --cfg_weight) overrides meta.json ``cfg``;
+    if neither applies, returns {} so the model uses its own defaults.
+    """
+    ns = vars(args)
+    has_type = "cfg_type" in ns
+    has_wflag = "cfg_weight" in ns
+    cli_type = ns.get("cfg_type")
+    cli_w = ns.get("cfg_weight")
+
+    if has_wflag:
+        if cli_w is None or len(cli_w) == 0:
+            raise ValueError("--cfg_weight requires one float (regular) or two floats (separated).")
+
+    if has_type and cli_type == "nocfg":
+        if has_wflag:
+            raise ValueError("--cfg_weight is not used with --cfg_type nocfg.")
+        return {"cfg_type": "nocfg"}
+
+    if has_type or has_wflag:
+        if has_type:
+            eff_type = cli_type
+            if has_wflag:
+                if eff_type == "regular" and len(cli_w) != 1:
+                    raise ValueError("--cfg_type regular requires exactly one --cfg_weight value.")
+                if eff_type == "separated" and len(cli_w) != 2:
+                    raise ValueError("--cfg_type separated requires exactly two --cfg_weight values.")
+            else:
+                if eff_type == "regular":
+                    raise ValueError("--cfg_type regular requires --cfg_weight with one float.")
+                if eff_type == "separated":
+                    raise ValueError("--cfg_type separated requires --cfg_weight with two floats.")
+        else:
+            if len(cli_w) == 1:
+                eff_type = "regular"
+            elif len(cli_w) == 2:
+                eff_type = "separated"
+            else:
+                raise ValueError("--cfg_weight expects 1 float (regular) or 2 floats (separated).")
+
+        if eff_type == "regular":
+            return {"cfg_type": "regular", "cfg_weight": float(cli_w[0])}
+        return {"cfg_type": "separated", "cfg_weight": [float(cli_w[0]), float(cli_w[1])]}
+
+    if meta and isinstance(meta.get("cfg"), dict):
+        cfg = meta["cfg"]
+        enabled = cfg.get("enabled", True)
+        if not enabled:
+            return {"cfg_type": "nocfg"}
+        return {
+            "cfg_type": "separated",
+            "cfg_weight": [
+                float(cfg.get("text_weight", 2.0)),
+                float(cfg.get("constraint_weight", 2.0)),
+            ],
+        }
+
+    return {}
 
 
 def get_generation_inputs(args, fps: float):
@@ -145,6 +234,7 @@ def get_generation_inputs(args, fps: float):
             "diffusion_steps": args.diffusion_steps,
             "seed": args.seed,
             "constraints_path": args.constraints,
+            "meta": None,
         }
 
     meta_path = os.path.join(args.input_folder, "meta.json")
@@ -164,6 +254,7 @@ def get_generation_inputs(args, fps: float):
         "diffusion_steps": meta.get("diffusion_steps", args.diffusion_steps),
         "seed": meta.get("seed", args.seed),
         "constraints_path": constraints_path,
+        "meta": meta,
     }
 
 
@@ -207,6 +298,15 @@ def main():
     if generation_inputs["seed"] is not None:
         seed_everything(generation_inputs["seed"])
 
+    cfg_kwargs = resolve_cfg_kwargs(args, generation_inputs.get("meta"))
+    if cfg_kwargs:
+        ct = cfg_kwargs.get("cfg_type")
+        cw = cfg_kwargs.get("cfg_weight")
+        if cw is not None:
+            print(f"Using CFG: cfg_type={ct!r}, cfg_weight={cw!r}")
+        else:
+            print(f"Using CFG: cfg_type={ct!r}")
+
     # G1: postprocessing is disabled (does not work well for this model).
     use_postprocess = False if "g1" in resolved_model else (not args.no_postprocess)
     output = model(
@@ -219,6 +319,7 @@ def main():
         num_transition_frames=args.num_transition_frames,
         post_processing=use_postprocess,
         return_numpy=True,
+        **cfg_kwargs,
     )
 
     n_samples = int(output["posed_joints"].shape[0])

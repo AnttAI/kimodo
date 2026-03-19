@@ -15,7 +15,7 @@ import viser
 from kimodo.assets import DEMO_ASSETS_ROOT
 from kimodo.model.load_model import load_model
 from kimodo.model.registry import resolve_model_name
-from kimodo.skeleton import SkeletonBase
+from kimodo.skeleton import SkeletonBase, SOMASkeleton30
 from kimodo.tools import load_json
 from kimodo.viz import viser_utils
 from kimodo.viz.viser_utils import (
@@ -133,10 +133,13 @@ class Demo:
         if hasattr(model, "text_encoder"):
             model.text_encoder = CachedTextEncoder(model.text_encoder, model_name=model_name)
 
+        skeleton = model.motion_rep.skeleton
+        if isinstance(skeleton, SOMASkeleton30):
+            skeleton = skeleton.somaskel77.to(model.device)
         bundle = ModelBundle(
             model=model,
             motion_rep=model.motion_rep,
-            skeleton=model.motion_rep.skeleton,
+            skeleton=skeleton,
             model_fps=model.motion_rep.fps,
         )
         self.models[model_name] = bundle
@@ -345,9 +348,7 @@ class Demo:
                 save_choice="kimodo.demo.quick_start_ack",
             ) as modal:
                 client.gui.add_markdown(DEMO_UI_QUICK_START_MODAL_MD)
-                client.gui.add_button("Got it (don't remind me again)").on_click(
-                    lambda _event: modal.close()
-                )
+                client.gui.add_button("Got it (don't remind me again)").on_click(lambda _event: modal.close())
             self._setup_demo_for_client(client)
 
     def setup_scene(self, client: viser.ClientHandle) -> None:
@@ -482,9 +483,10 @@ class Demo:
     def compute_model_constraints_lst(
         self,
         session: ClientSession,
+        model_bundle: ModelBundle,
         num_frames: int,
     ):
-        return generation.compute_model_constraints_lst(session, num_frames, self.device)
+        return generation.compute_model_constraints_lst(session, model_bundle, num_frames, self.device)
 
     def generate(
         self,

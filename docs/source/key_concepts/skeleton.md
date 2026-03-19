@@ -10,9 +10,16 @@ The skeletons discussed on this page are defined in `kimodo/skeleton/definitions
 ## SOMA (default)
 
 SOMA is the default skeleton used for Kimodo. It it based on the [SOMA body model](https://github.com/NVlabs/SOMA-X), which is also used in the [BONES-SEED dataset](https://huggingface.co/datasets/bones-studio/seed).
-The original SOMA skeleton has 77 joints, but Kimodo operates on a subset of 30 joints that exclude most hand/finger joints. Note that all training data for Kimodo is on a uniform skeleton proportion corresponding to one single set of identity parameters for the SOMA body model.
+Kimodo uses two closely related SOMA skeleton definitions:
 
-<img src="../_static/skeletons/soma.png" alt="SOMA skeleton" width="60%">
+- **`somaskel30`**: the reduced 30-joint skeleton used internally by the model and by the core SOMA constraint formulation. It removes most finger and hand detail.
+- **`somaskel77`**: the full 77-joint SOMA skeleton used for public-facing visualization and SOMA motion exports.
+
+In practice, Kimodo predicts SOMA motions on `somaskel30` and converts them to `somaskel77` when returning or visualizing results in the demo. Older assets and examples may still be stored on `somaskel30`, and the tooling keeps backward compatibility with those files.
+
+Note that all training data for Kimodo is on a uniform skeleton proportion corresponding to one single set of identity parameters for the SOMA body model.
+
+!["SOMA skeletons"](../_static/skeletons/soma_skels.png)
 
 Outputs on the SOMA skeleton can be visualized in two ways. The first is by articulating a fixed SOMA rig and doing traditional skinning (corresponds to `kimodo/viz/soma_skin.py` in the codebase).
 Alternatively, we can take generated joint rotations and feed them through the SOMA layer with the set of identity parameters that correspond to the body shape of our uniform skeleton. An example of this in the codebase at `kimodo/viz/soma_layer_skin.py`, which uses the identity parameters defined from `kimodo/assets/skeletons/somaskel30/soma_base_fit_mhr_params.npz` (the same ones from BONES-SEED data).

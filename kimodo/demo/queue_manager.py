@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
-
 """HF mode user queue and session time limit."""
 
 import math
@@ -33,7 +32,10 @@ class UserQueue:
         self._lock = threading.Lock()
 
     def try_activate(self, client_id: int) -> bool:
-        """If a slot is free, add client as active and return True. Else return False."""
+        """If a slot is free, add client as active and return True.
+
+        Else return False.
+        """
         with self._lock:
             if len(self._active) < self._max_active:
                 self._active[client_id] = time.time()
@@ -46,7 +48,10 @@ class UserQueue:
                 self._queued.append(client_id)
 
     def remove(self, client_id: int) -> bool:
-        """Remove from active or queue. Returns True if was active."""
+        """Remove from active or queue.
+
+        Returns True if was active.
+        """
         with self._lock:
             was_active = client_id in self._active
             self._active.pop(client_id, None)
@@ -55,7 +60,10 @@ class UserQueue:
             return was_active
 
     def promote_next(self) -> int | None:
-        """If queue non-empty, pop first, activate them, return their client_id. Else None."""
+        """If queue non-empty, pop first, activate them, return their client_id.
+
+        Else None.
+        """
         with self._lock:
             if not self._queued:
                 return None
@@ -192,7 +200,9 @@ class QueueManager:
 
     def on_client_disconnect(self, client_id: int) -> None:
         """Remove from queue/active, cancel timer, promote next if was active.
-        Session/scene cleanup is done by the demo's on_client_disconnect."""
+
+        Session/scene cleanup is done by the demo's on_client_disconnect.
+        """
         with self._lock:
             self._expiry_timers.pop(client_id, None)
             self._queue_modal_handles.pop(client_id, None)
@@ -228,9 +238,7 @@ class QueueManager:
             save_choice="kimodo.demo.quick_start_ack",
         ) as quick_start_modal:
             client.gui.add_markdown(DEMO_UI_QUICK_START_MODAL_MD)
-            client.gui.add_button("Got it (don't remind me again)").on_click(
-                lambda _: quick_start_modal.close()
-            )
+            client.gui.add_button("Got it (don't remind me again)").on_click(lambda _: quick_start_modal.close())
 
     def _show_welcome_modal(self, client: viser.ClientHandle) -> None:
         client_id = client.client_id

@@ -255,6 +255,27 @@ class SOMASkeleton30(SkeletonBase):
         local_joint_rots_mats[:, skel_slice] = local_joint_rots_subset
         return local_joint_rots_mats
 
+    @ensure_batched(local_joint_rots_full=4)
+    def from_SOMASkeleton77(self, local_joint_rots_full: torch.Tensor) -> torch.Tensor:
+        """Extract the 30-joint subset from 77-joint local rotation data."""
+        skel_slice = self.get_skel_slice(self.somaskel77)
+        return local_joint_rots_full[:, skel_slice]
+
+    def output_to_SOMASkeleton77(self, output: dict) -> dict:
+        """Convert model output dict from somaskel30 to somaskel77.
+
+        Expands local_rot_mats to 77 joints, re-runs FK for global_rot_mats and posed_joints. Root
+        and foot-contact keys are unchanged.
+        """
+        local_rot_mats_77 = self.to_SOMASkeleton77(output["local_rot_mats"])
+        root_positions = output["root_positions"]
+        global_rot_mats_77, posed_joints_77, _ = self.somaskel77.fk(local_rot_mats_77, root_positions)
+        out_77 = dict(output)
+        out_77["local_rot_mats"] = local_rot_mats_77
+        out_77["global_rot_mats"] = global_rot_mats_77
+        out_77["posed_joints"] = posed_joints_77
+        return out_77
+
 
 class G1Skeleton34(SkeletonBase):
     """Unitree G1 skeleton with 32 articulated joints plus 2 toe endpoints."""

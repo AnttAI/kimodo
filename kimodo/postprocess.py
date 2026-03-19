@@ -19,6 +19,7 @@ from .skeleton import (
     SkeletonBase,
     SMPLXSkeleton22,
     SOMASkeleton30,
+    SOMASkeleton77,
     fk,
 )
 
@@ -267,7 +268,7 @@ def post_process_motion(
         )
 
     # Create working rig
-    above_ground_offset = 0.03 if isinstance(skeleton, SOMASkeleton30) else 0.007
+    above_ground_offset = 0.02 if isinstance(skeleton, (SOMASkeleton30, SOMASkeleton77)) else 0.007
     # larger offset for SOMA since model tends to generate lower to the ground
     working_rig = create_working_rig_from_skeleton(skeleton, above_ground_offset=above_ground_offset)
     has_double_ankle_joints = isinstance(skeleton, G1Skeleton34)

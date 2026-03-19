@@ -18,6 +18,7 @@ from kimodo.skeleton import (
     SkeletonBase,
     SMPLXSkeleton22,
     SOMASkeleton30,
+    SOMASkeleton77,
 )
 
 from .coords import rotation_matrix_from_two_vec
@@ -165,13 +166,21 @@ class SkeletonMesh:
                 3,
             ), "Joint colors must be (J, 3)"
             self.joint_colors = joint_color
+        joint_scales = np.ones((self.num_joints, 3))
+        hand_roots = {"LeftHand", "RightHand"}
+        finger_joint_names = set(skeleton.left_hand_joint_names + skeleton.right_hand_joint_names) - hand_roots
+        for jname in finger_joint_names:
+            if jname in skeleton.bone_index:
+                joint_scales[skeleton.bone_index[jname]] = 0.6
+        self.joint_scales = joint_scales
+
         self.joints_batched_mesh = server.scene.add_batched_meshes_simple(
             f"{name}/joints",
             vertices=joint_mesh.vertices,
             faces=joint_mesh.faces,
             batched_wxyzs=init_joints_wxyzs,
             batched_positions=np.zeros((self.num_joints, 3)),
-            batched_scales=np.ones((self.num_joints, 3)),
+            batched_scales=joint_scales,
             batched_colors=self.joint_colors,
         )
         init_bones_wxyzs = np.concatenate([np.ones((num_bones, 1)), np.zeros((num_bones, 3))], axis=1)
@@ -195,7 +204,11 @@ class SkeletonMesh:
         if starting_joints_pos is not None:
             self.set_pose(starting_joints_pos)
         else:
-            min_height = init_joints_pos[:, 1].min().item()
+            if isinstance(skeleton, SOMASkeleton77):
+                skel30 = SOMASkeleton30(load=True)
+                min_height = skel30.neutral_joints[:, 1].min().item()
+            else:
+                min_height = init_joints_pos[:, 1].min().item()
             init_joints_pos[:, 1] -= min_height  # move to be on ground
             self.set_pose(init_joints_pos)
 
@@ -351,7 +364,7 @@ class Character:
         self.mesh_mode = mesh_mode
         self.g1_mesh_rig = None
         if create_skinned_mesh:
-            if isinstance(self.skeleton, SOMASkeleton30) and mesh_mode in [
+            if isinstance(self.skeleton, (SOMASkeleton30, SOMASkeleton77)) and mesh_mode in [
                 "soma_skin",
                 "soma_layer_skin",
             ]:
@@ -401,9 +414,13 @@ class Character:
                 self.skinned_verts_cache = None
 
                 bind_pos = self.skeleton.neutral_joints.clone()
-                min_height = bind_pos[:, 1].min().item()
+                if isinstance(self.skeleton, SOMASkeleton77):
+                    skel30 = SOMASkeleton30(load=True)
+                    min_height = skel30.neutral_joints[:, 1].min().item()
+                else:
+                    min_height = bind_pos[:, 1].min().item()
                 bind_pos[:, 1] -= min_height
-                bind_pos[:, 1] += 0.03
+                bind_pos[:, 1] += 0.02
                 bind_rotmat = torch.eye(3, device=bind_pos.device).repeat(bind_pos.shape[0], 1, 1)
                 self.set_pose(bind_pos, bind_rotmat)
                 self.skinned_mesh.visible = True

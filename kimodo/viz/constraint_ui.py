@@ -446,7 +446,7 @@ class EEJointsKeyframeSet(ConstraintSet):
                 ee_joint_indices.extend([self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names])
                 if len(expanded_joint_names) > 1:
                     ee_gizmo_indices.extend(
-                        [self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names[:-1]]
+                        [self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names[:1]]
                     )
                 constrained_bone_idx.extend(
                     [self.skeleton.bone_order_names_index[joint] - 1 for joint in expanded_joint_names[1:]]
@@ -563,9 +563,10 @@ class EEJointsKeyframeSet(ConstraintSet):
                                 "LeftFoot": self.skeleton.left_foot_joint_names,
                                 "RightFoot": self.skeleton.right_foot_joint_names,
                             }[joint_name]
-                            if len(expanded_joint_names) > 1:
+                            if len(expanded_joint_names) > 0:
                                 ee_gizmo_indices.extend(
-                                    [self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names[:-1]]
+                                    [self.skeleton.bone_order_names_index[joint] for joint in expanded_joint_names[:1]]
+                                    # take only the base joint of the end effector (to avoid clutter)
                                 )
                         else:
                             raise ValueError(f"Invalid joint name: {joint_name}")

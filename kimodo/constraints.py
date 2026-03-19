@@ -8,10 +8,31 @@ import torch
 from torch import Tensor
 
 from kimodo.motion_rep.feature_utils import compute_heading_angle
-from kimodo.skeleton import SkeletonBase
-from kimodo.tools import load_json, save_json
+from kimodo.skeleton import SkeletonBase, SOMASkeleton30, SOMASkeleton77
+from kimodo.tools import ensure_batched, load_json, save_json
 
 from .geometry import axis_angle_to_matrix, matrix_to_axis_angle
+
+
+def _convert_constraint_local_rots_to_skeleton(local_rot_mats: Tensor, skeleton: SkeletonBase) -> Tensor:
+    """Convert loaded local rotation matrices to match the skeleton's joint count.
+
+    Handles SOMA 30↔77: constraint files may have been saved with 30 or 77 joints while the session
+    skeleton (e.g. from the SOMA30 model) uses SOMASkeleton77.
+    """
+    n_joints = local_rot_mats.shape[-3]
+    skeleton_joints = skeleton.nbjoints
+    if n_joints == skeleton_joints:
+        return local_rot_mats
+    if n_joints == 77 and skeleton_joints == 30 and isinstance(skeleton, SOMASkeleton30):
+        return skeleton.from_SOMASkeleton77(local_rot_mats)
+    if n_joints == 30 and skeleton_joints == 77 and isinstance(skeleton, SOMASkeleton77):
+        skel30 = SOMASkeleton30()
+        return skel30.to_SOMASkeleton77(local_rot_mats)
+    raise ValueError(
+        f"Constraint joint count ({n_joints}) does not match skeleton joint count "
+        f"({skeleton_joints}). Only SOMA 30↔77 conversion is supported."
+    )
 
 
 def create_pairs(tensor_A: Tensor, tensor_B: Tensor) -> Tensor:
@@ -251,6 +272,8 @@ class FullBodyConstraintSet:
     def get_save_info(self) -> dict:
         """Return a dict for JSON save: type, frame_indices, local_joints_rot, root_positions, smooth_root_2d."""
         local_joints_rot = self.skeleton.global_rots_to_local_rots(self.global_joints_rots)
+        if isinstance(self.skeleton, SOMASkeleton30):
+            local_joints_rot = self.skeleton.to_SOMASkeleton77(local_joints_rot)
         local_joints_rot = matrix_to_axis_angle(local_joints_rot)
 
         root_positions = self.global_joints_positions[:, self.skeleton.root_idx]
@@ -282,8 +305,11 @@ class FullBodyConstraintSet:
         """Build a FullBodyConstraintSet from a dict (e.g. loaded from JSON)."""
         frame_indices = torch.tensor(dico["frame_indices"])
         device = skeleton.device if hasattr(skeleton, "device") else "cpu"
+        local_rot = torch.tensor(dico["local_joints_rot"], device=device)
+        local_rot_mats = axis_angle_to_matrix(local_rot)
+        local_rot_mats = _convert_constraint_local_rots_to_skeleton(local_rot_mats, skeleton)
         global_joints_rots, global_joints_positions, _ = skeleton.fk(
-            axis_angle_to_matrix(torch.tensor(dico["local_joints_rot"], device=device)),
+            local_rot_mats,
             torch.tensor(dico["root_positions"], device=device),
         )
         smooth_root_2d = None
@@ -421,6 +447,8 @@ class EndEffectorConstraintSet:
     def get_save_info(self) -> dict:
         """Return a dict for JSON save: type, frame_indices, local_joints_rot, root_positions, smooth_root_2d, joint_names."""
         local_joints_rot = self.skeleton.global_rots_to_local_rots(self.global_joints_rots)
+        if isinstance(self.skeleton, SOMASkeleton30):
+            local_joints_rot = self.skeleton.to_SOMASkeleton77(local_joints_rot)
         local_joints_rot = matrix_to_axis_angle(local_joints_rot)
 
         root_positions = self.global_joints_positions[:, self.skeleton.root_idx]
@@ -459,8 +487,11 @@ class EndEffectorConstraintSet:
         """Build an EndEffectorConstraintSet from a dict (e.g. loaded from JSON)."""
         frame_indices = torch.tensor(dico["frame_indices"])
         device = skeleton.device if hasattr(skeleton, "device") else "cpu"
+        local_rot = torch.tensor(dico["local_joints_rot"], device=device)
+        local_rot_mats = axis_angle_to_matrix(local_rot)
+        local_rot_mats = _convert_constraint_local_rots_to_skeleton(local_rot_mats, skeleton)
         global_joints_rots, global_joints_positions, _ = skeleton.fk(
-            axis_angle_to_matrix(torch.tensor(dico["local_joints_rot"], device=device)),
+            local_rot_mats,
             torch.tensor(dico["root_positions"], device=device),
         )
         smooth_root_2d = None

@@ -35,7 +35,7 @@ from .config import (
     SHOW_TRANSITION_PARAMS,
 )
 from .state import ClientSession
-from kimodo.skeleton import G1Skeleton34
+from kimodo.skeleton import G1Skeleton34, SOMASkeleton30, SOMASkeleton77
 
 
 def extract_intervals_and_singles(t: torch.Tensor):
@@ -719,26 +719,47 @@ def create_gui(
                 )
                 gui_load_example_from_path_button = client.gui.add_button("Load Example")
 
-            def _to_unbatched(arr: np.ndarray) -> np.ndarray:
-                """Remove leading batch dimension so saved/exported files are always unbatched [T, ...]."""
-                arr = np.asarray(arr)
-                if arr.ndim == 4 or arr.ndim == 5:
-                    return arr[0]
-                if arr.ndim == 3 and arr.shape[0] == 1:
-                    return arr[0]
-                return arr
+            def _get_primary_motion(session: ClientSession):
+                return list(session.motions.values())[0]
+
+            def _motion_to_numpy_dict(motion) -> dict[str, np.ndarray]:
+                joints_pos = motion.joints_pos.detach().cpu().numpy()
+                joints_rot = motion.joints_rot.detach().cpu().numpy()
+                joints_local_rot = motion.joints_local_rot.detach().cpu().numpy()
+
+                if joints_pos.ndim != 3:
+                    raise ValueError(f"Expected unbatched joints_pos with shape [T, J, 3], got {joints_pos.shape}")
+                if joints_rot.ndim != 4:
+                    raise ValueError(
+                        f"Expected unbatched joints_rot with shape [T, J, 3, 3], got {joints_rot.shape}"
+                    )
+                if joints_local_rot.ndim != 4:
+                    raise ValueError(
+                        "Expected unbatched joints_local_rot with shape "
+                        f"[T, J, 3, 3], got {joints_local_rot.shape}"
+                    )
+
+                motion_data = {
+                    "posed_joints": joints_pos,
+                    "global_rot_mats": joints_rot,
+                    "local_rot_mats": joints_local_rot,
+                    "root_positions": joints_pos[:, motion.skeleton.root_idx, :],
+                }
+                if motion.foot_contacts is not None:
+                    foot_contacts = motion.foot_contacts.detach().cpu().numpy()
+                    if foot_contacts.ndim != 2:
+                        raise ValueError(
+                            f"Expected unbatched foot_contacts with shape [T, C], got {foot_contacts.shape}"
+                        )
+                    motion_data["foot_contacts"] = foot_contacts
+                return motion_data
 
             def save_motion(client, save_path):
                 session = demo.client_sessions[client.client_id]
                 # only save the first motion
-                motion = list(session.motions.values())[0]
-                motion_data = {
-                    "posed_joints": _to_unbatched(motion.joints_pos.cpu().numpy()),
-                    "global_rot_mats": _to_unbatched(motion.joints_rot.cpu().numpy()),
-                    "local_rot_mats": _to_unbatched(motion.joints_local_rot.cpu().numpy()),
-                }
-                if motion.foot_contacts is not None:
-                    motion_data["foot_contacts"] = _to_unbatched(motion.foot_contacts.cpu().numpy())
+                motion = _get_primary_motion(session)
+                motion_data = _motion_to_numpy_dict(motion)
+                motion_data.pop("root_positions")
                 np.savez(save_path, **motion_data)
 
             @gui_save_motion_button.on_click
@@ -801,16 +822,35 @@ def create_gui(
                 if foot_contacts is not None and foot_contacts.ndim == 3:
                     foot_contacts = foot_contacts[0]
 
-                # Motion must have the same number of joints as the current model's skeleton
+                # Motion must have the same number of joints as the current model's skeleton (77 for SOMA)
                 num_joints_loaded = joints_pos.shape[1]
                 num_joints_skeleton = session.skeleton.nbjoints
                 if num_joints_loaded != num_joints_skeleton:
-                    raise ValueError(
-                        f"The loaded motion has {num_joints_loaded} joints but the current model "
-                        f"({session.model_name}) has {num_joints_skeleton} joints. "
-                        "Load a motion generated with the same skeleton, or switch the model to match the motion."
-                    )
-                if joints_rot.shape[1] != num_joints_skeleton:
+                    # Backward compat: expand 30-joint SOMA motion to 77
+                    if (
+                        num_joints_loaded == 30
+                        and num_joints_skeleton == 77
+                        and isinstance(session.skeleton, SOMASkeleton77)
+                    ):
+                        from kimodo.skeleton import global_rots_to_local_rots
+
+                        skel30 = SOMASkeleton30().to(demo.device)
+                        if "local_rot_mats" in data:
+                            local_rot_30 = torch.from_numpy(data["local_rot_mats"]).to(demo.device)
+                            if local_rot_30.ndim == 4:
+                                local_rot_30 = local_rot_30[0]
+                        else:
+                            local_rot_30 = global_rots_to_local_rots(joints_rot, skel30)
+                        local_rot_77 = skel30.to_SOMASkeleton77(local_rot_30)
+                        root_positions = joints_pos[:, skel30.root_idx, :]
+                        joints_rot, joints_pos, _ = session.skeleton.fk(local_rot_77, root_positions)
+                    else:
+                        raise ValueError(
+                            f"The loaded motion has {num_joints_loaded} joints but the current model "
+                            f"({session.model_name}) has {num_joints_skeleton} joints. "
+                            "Load a motion generated with the same skeleton, or switch the model to match the motion."
+                        )
+                elif joints_rot.shape[1] != num_joints_skeleton:
                     raise ValueError(
                         f"Rotation data has {joints_rot.shape[1]} joints but the current model has "
                         f"{num_joints_skeleton} joints. The NPZ may be corrupted or from a different skeleton."
@@ -880,7 +920,8 @@ def create_gui(
                 # Keep save behavior aligned with demo frame convention:
                 # valid frame indices are [0, max_frame_idx], so count is +1.
                 num_frames = session.max_frame_idx + 1
-                constraints_lst = demo.compute_model_constraints_lst(session, num_frames)
+                model_bundle = demo.load_model(session.model_name)
+                constraints_lst = demo.compute_model_constraints_lst(session, model_bundle, num_frames)
                 save_constraints_lst(save_path, constraints_lst)
 
             @gui_save_constraints_button.on_click
@@ -1142,7 +1183,11 @@ def create_gui(
                 )
                 gui_download_format_dropdown = client.gui.add_dropdown(
                     "Format",
-                    options=["NPZ", "BVH"],
+                    options=(
+                        ["NPZ", "CSV"]
+                        if "g1" in model_name.lower()
+                        else ["NPZ", "AMASS NPZ"] if "smplx" in model_name.lower() else ["NPZ", "BVH"]
+                    ),
                     initial_value="NPZ",
                 )
                 gui_download_button = client.gui.add_button(
@@ -1201,16 +1246,61 @@ def create_gui(
             def _motion_to_npz_bytes(motion) -> bytes:
                 import io
 
-                motion_data = {
-                    "posed_joints": _to_unbatched(motion.joints_pos.detach().cpu().numpy()),
-                    "global_rot_mats": _to_unbatched(motion.joints_rot.detach().cpu().numpy()),
-                    "local_rot_mats": _to_unbatched(motion.joints_local_rot.detach().cpu().numpy()),
-                }
-                if getattr(motion, "foot_contacts", None) is not None:
-                    motion_data["foot_contacts"] = _to_unbatched(motion.foot_contacts.detach().cpu().numpy())
+                motion_data = _motion_to_numpy_dict(motion)
+                motion_data.pop("root_positions")
                 buf = io.BytesIO()
                 np.savez(buf, **motion_data)
                 return buf.getvalue()
+
+            def _motion_to_csv_bytes(motion, session: ClientSession) -> bytes:
+                import io
+
+                from kimodo.exports.mujoco import MujocoQposConverter
+
+                motion_data = _motion_to_numpy_dict(motion)
+                converter = MujocoQposConverter(session.skeleton)
+                qpos = converter.dict_to_qpos(
+                    {
+                        "local_rot_mats": motion_data["local_rot_mats"],
+                        "root_positions": motion_data["root_positions"],
+                    },
+                    demo.device,
+                    numpy=True,
+                )
+                buf = io.StringIO()
+                np.savetxt(buf, qpos, delimiter=",")
+                return buf.getvalue().encode("utf-8")
+
+            def _motion_to_amass_npz_bytes(motion, session: ClientSession) -> bytes:
+                import io
+
+                from kimodo.exports.smplx import AMASSConverter
+
+                motion_data = _motion_to_numpy_dict(motion)
+                converter = AMASSConverter(skeleton=session.skeleton, fps=session.model_fps)
+                buf = io.BytesIO()
+                converter.convert_save_npz(
+                    {
+                        "local_rot_mats": motion_data["local_rot_mats"],
+                        "root_positions": motion_data["root_positions"],
+                    },
+                    buf,
+                )
+                return buf.getvalue()
+
+            def _get_motion_export_formats(loaded_model_name: str) -> list[str]:
+                model_name_lower = (loaded_model_name or "").lower()
+                if "g1" in model_name_lower:
+                    return ["NPZ", "CSV"]
+                if "smplx" in model_name_lower:
+                    return ["NPZ", "AMASS NPZ"]
+                return ["NPZ", "BVH"]
+
+            def _update_motion_export_dropdown(loaded_model_name: str) -> None:
+                new_options = _get_motion_export_formats(loaded_model_name)
+                current_value = str(gui_download_format_dropdown.value)
+                gui_download_format_dropdown.options = new_options
+                gui_download_format_dropdown.value = current_value if current_value in new_options else new_options[0]
 
             def _coerce_download_filename(raw_name: str, *, ext: str) -> str:
                 """Coerce a user-entered filename to a safe basename with the desired extension.
@@ -1227,7 +1317,7 @@ def create_gui(
                 if name == "":
                     return f"output{ext}"
 
-                known_exts = (".npz", ".bvh", ".png", ".mp4")
+                known_exts = (".npz", ".bvh", ".csv", ".png", ".mp4")
                 lower = name.lower()
                 if lower.endswith(known_exts):
                     return os.path.splitext(name)[0] + ext
@@ -1405,7 +1495,7 @@ def create_gui(
                 session = get_active_session(event_client)
                 if session is None:
                     return
-                motion = list(session.motions.values())[0]
+                motion = _get_primary_motion(session)
                 try:
                     fmt = str(gui_download_format_dropdown.value).upper()
                     raw_name = str(gui_download_name_text.value)
@@ -1419,6 +1509,14 @@ def create_gui(
                             fps=float(session.model_fps),
                         )
                         mime = "text/plain"
+                    elif fmt == "CSV":
+                        filename = _coerce_download_filename(raw_name, ext=".csv")
+                        payload = _motion_to_csv_bytes(motion, session)
+                        mime = "text/csv"
+                    elif fmt == "AMASS NPZ":
+                        filename = _coerce_download_filename(raw_name, ext=".npz")
+                        payload = _motion_to_amass_npz_bytes(motion, session)
+                        mime = "application/octet-stream"
                     else:
                         # Default to NPZ (most common and matches existing save/load).
                         filename = _coerce_download_filename(raw_name, ext=".npz")
@@ -1643,6 +1741,7 @@ def create_gui(
             """Update model-specific controls from the currently loaded model only."""
             if not loaded_model_name:
                 return
+            _update_motion_export_dropdown(loaded_model_name)
             gui_use_soma_layer_checkbox.visible = "soma" in loaded_model_name
             _is_g1 = "g1" in loaded_model_name
             gui_real_robot_rotations_checkbox.visible = _is_g1
