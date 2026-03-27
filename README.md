@@ -204,6 +204,76 @@ As detailed in the [tech report](https://research.nvidia.com/labs/sil/projects/k
 While the full [Rigplay 1](https://bones.studio/datasets#rp01) dataset is proprietary, we have released the temporal segmentations for the public [BONES-SEED](https://huggingface.co/datasets/bones-studio/seed) subset.
 These annotations are already included in the BONES-SEED dataset, but the standalone labels and additional information about them is [available on HuggingFace](https://huggingface.co/datasets/nvidia/SEED-Timeline-Annotations).
 
+## T1 Demo Setup and Testing
+
+This branch also includes a local ANTT T1 arm-planning demo for constraint editing and PyRoki-based IK playback:
+
+- `kimodo_demo2`: ANTT T1 arm-only demo with `Left Hand` and `Right Hand` timeline tracks
+- `kimodo_demo_lite`: playback-oriented Kimodo demo UI without model generation
+- `kimodo_view`: lightweight local NPZ motion viewer
+
+Current assumptions for `kimodo_demo2`:
+
+- a local `pyroki` checkout is present at `./pyroki`
+- a local `kimodo-viser` checkout is present at `./kimodo-viser`
+- the ANTT T1 assets live under `pyroki/examples/nero_both_arms/`
+
+### Setup
+
+Use the `kimodo` conda environment, then install the local dependencies:
+
+```bash
+conda activate kimodo
+python -m pip install -e ./kimodo-viser
+python -m pip install -e ./pyroki
+python -m pip install -e .
+```
+
+On non-x86 machines such as Apple Silicon, the editable install skips `MotionCorrection` automatically.
+
+### Launch
+
+Start the T1 demo with:
+
+```bash
+conda activate kimodo
+python -m kimodo.scripts.demo2
+```
+
+Or use the console entrypoint:
+
+```bash
+kimodo_demo2
+```
+
+The app runs locally on `http://127.0.0.1:7860`.
+
+### What the T1 Demo Does
+
+- loads the ANTT T1 URDF from `pyroki/examples/nero_both_arms/antt_t1.urdf`
+- displays the full arm + gripper robot in the Kimodo timeline UI
+- supports `Left Hand` and `Right Hand` end-effector keyframes only
+- supports translating and rotating the target gizmos in editing mode
+- solves per-frame arm IK with PyRoki and plays back the solved trajectory
+
+### Testing Flow
+
+1. Launch `kimodo_demo2`.
+2. Open `http://127.0.0.1:7860`.
+3. Add a `Left Hand` or `Right Hand` keyframe on the timeline.
+4. Move the playhead to that exact frame.
+5. Click `Enter Editing Mode`.
+6. Drag or rotate the hand target gizmo.
+7. Click `Solve With PyRoki`.
+8. Press `Space` to play the solved motion.
+
+### Current Limitations
+
+- `kimodo_demo2` is not a text-to-motion generator; it is a PyRoki-backed constraint editor and playback tool
+- it currently depends on sibling local repos instead of packaged dependencies
+- solve behavior is framewise IK plus interpolation, not full trajectory optimization
+- collision handling is still under active tuning for arm-arm and arm-stand interactions
+
 
 ## Related Humanoid Work at NVIDIA
 Kimodo is part of a larger effort to enable humanoid motion data for robotics, physical AI, and other applications.
