@@ -70,6 +70,8 @@ def create_gui(
     client: viser.ClientHandle,
     model_name: str,
     model_fps: float,
+    playback_only: bool = False,
+    allowed_constraint_tracks: Optional[tuple[str, ...]] = None,
 ):
     """Create GUI elements for a specific client."""
     client_id = client.client_id
@@ -87,83 +89,35 @@ def create_gui(
         timeline.set_visible(True)
         timeline.set_current_frame(0)
 
+        allowed_tracks = set(allowed_constraint_tracks) if allowed_constraint_tracks is not None else None
+        track_specs = [
+            ("Full-Body", "keyframe", (219, 148, 86), 0.5),
+            ("2D Root", "keyframe", (150, 100, 200), 0.5),
+            ("Left Hand", "keyframe", (100, 200, 150), 0.5),
+            ("Right Hand", "keyframe", (200, 100, 150), 0.5),
+            ("Left Foot", "keyframe", (219, 148, 86), 0.5),
+            ("Right Foot", "keyframe", (150, 100, 200), 0.5),
+        ]
         timeline_tracks = {}
-        fullbody_id = timeline.add_track(
-            "Full-Body",
-            track_type="keyframe",
-            color=(219, 148, 86),
-            height_scale=0.5,
-        )
-        timeline_tracks[fullbody_id] = {
-            "name": "Full-Body",
-            "track_type": "keyframe",
-            "color": (219, 148, 86),
-            "height_scale": 0.5,
-        }
-
-        root2d_id = timeline.add_track(
-            "2D Root",
-            track_type="keyframe",
-            color=(150, 100, 200),
-            height_scale=0.5,
-        )
-        timeline_tracks[root2d_id] = {
-            "name": "2D Root",
-            "track_type": "keyframe",
-            "color": (150, 100, 200),
-            "height_scale": 0.5,
-        }
-        lefthand_id = timeline.add_track(
-            "Left Hand",
-            track_type="keyframe",
-            color=(100, 200, 150),
-            height_scale=0.5,
-        )
-        timeline_tracks[lefthand_id] = {
-            "name": "Left Hand",
-            "track_type": "keyframe",
-            "color": (100, 200, 150),
-            "height_scale": 0.5,
-        }
-        righthand_id = timeline.add_track(
-            "Right Hand",
-            track_type="keyframe",
-            color=(200, 100, 150),
-            height_scale=0.5,
-        )
-        timeline_tracks[righthand_id] = {
-            "name": "Right Hand",
-            "track_type": "keyframe",
-            "color": (200, 100, 150),
-            "height_scale": 0.5,
-        }
-        leftfoot_id = timeline.add_track(
-            "Left Foot",
-            track_type="keyframe",
-            color=(219, 148, 86),
-            height_scale=0.5,
-        )
-        timeline_tracks[leftfoot_id] = {
-            "name": "Left Foot",
-            "track_type": "keyframe",
-            "color": (219, 148, 86),
-            "height_scale": 0.5,
-        }
-        rightfoot_id = timeline.add_track(
-            "Right Foot",
-            track_type="keyframe",
-            color=(150, 100, 200),
-            height_scale=0.5,
-        )
-        timeline_tracks[rightfoot_id] = {
-            "name": "Right Foot",
-            "track_type": "keyframe",
-            "color": (150, 100, 200),
-            "height_scale": 0.5,
-        }
+        for track_name, track_type, color, height_scale in track_specs:
+            if allowed_tracks is not None and track_name not in allowed_tracks:
+                continue
+            track_id = timeline.add_track(
+                track_name,
+                track_type=track_type,
+                color=color,
+                height_scale=height_scale,
+            )
+            timeline_tracks[track_id] = {
+                "name": track_name,
+                "track_type": track_type,
+                "color": color,
+                "height_scale": height_scale,
+            }
         return timeline, timeline_tracks
 
     timeline, timeline_tracks = build_timeline_tracks()
+    has_root_track = any(track["name"] == "2D Root" for track in timeline_tracks.values())
     # These handles are part of GuiElements, but the demo currently uses timeline + buttons
     # embedded in the Viser UI instead of custom controls.
     gui_play_pause_button = None
@@ -234,6 +188,9 @@ def create_gui(
                 "Load model",
                 hint="Load the selected model (dataset, skeleton, version).",
             )
+            if playback_only:
+                gui_load_model_button.disabled = True
+                gui_load_model_button.hint = "Model loading is disabled in playback-only mode."
 
             class ModelSelectorHandle:
                 """Wrapper so session and callbacks can treat three dropdowns as one."""
@@ -459,6 +416,9 @@ def create_gui(
                 )
 
             gui_generate_button = client.gui.add_button("Generate", color="green")
+            if playback_only:
+                gui_generate_button.disabled = True
+                gui_generate_button.label = "Generation Disabled"
         with client.gui.add_folder("Constraints", expand_by_default=False):
             gui_gizmo_space_dropdown = client.gui.add_dropdown(
                 "Gizmo space",
@@ -484,7 +444,7 @@ def create_gui(
                 gui_dense_path_checkbox = client.gui.add_checkbox(
                     "Make Smooth Path",
                     initial_value=False,
-                    visible=True,
+                    visible=has_root_track,
                 )
 
             gui_show_only_current_constraint_checkbox = client.gui.add_checkbox(
@@ -920,8 +880,11 @@ def create_gui(
                 # Keep save behavior aligned with demo frame convention:
                 # valid frame indices are [0, max_frame_idx], so count is +1.
                 num_frames = session.max_frame_idx + 1
-                model_bundle = demo.load_model(session.model_name)
-                constraints_lst = demo.compute_model_constraints_lst(session, model_bundle, num_frames)
+                if playback_only:
+                    constraints_lst = demo.compute_model_constraints_lst(session, None, num_frames)
+                else:
+                    model_bundle = demo.load_model(session.model_name)
+                    constraints_lst = demo.compute_model_constraints_lst(session, model_bundle, num_frames)
                 save_constraints_lst(save_path, constraints_lst)
 
             @gui_save_constraints_button.on_click
@@ -2065,8 +2028,12 @@ def create_gui(
 
         def exit_editing_mode(session: ClientSession):
             gui_edit_constraint_button.label = "Enter Editing Mode"
-            gui_generate_button.disabled = False
-            gui_generate_button.label = "Generate"
+            if playback_only:
+                gui_generate_button.disabled = True
+                gui_generate_button.label = "Generation Disabled"
+            else:
+                gui_generate_button.disabled = False
+                gui_generate_button.label = "Generate"
             gui_reset_constraint_button.disabled = True
             if "g1" in session.model_name:
                 gui_gizmo_space_dropdown.value = "Local"
@@ -2082,6 +2049,8 @@ def create_gui(
 
             motion = list(session.motions.values())[0]
             motion.clear_all_gizmos()
+            if hasattr(demo, "exit_custom_edit_mode"):
+                demo.exit_custom_edit_mode(session)
             motion.character.set_skinned_mesh_wireframe(False)
             motion.character.set_skeleton_visibility(False)
             motion.character.set_skinned_mesh_visibility(True)
@@ -2108,7 +2077,7 @@ def create_gui(
             edit_alert = "Entered editing mode"
             no_edit_alert = "Exited editing mode"
             edit_message = "You can now modify pose or path constraints."
-            no_edit_message = "Can now generate motions."
+            no_edit_message = "You can scrub, annotate, and save constraints."
             event_client.add_notification(
                 title=edit_alert if session.edit_mode else no_edit_alert,
                 body=edit_message if session.edit_mode else no_edit_message,
@@ -2119,7 +2088,9 @@ def create_gui(
             if session.edit_mode:
                 gui_edit_constraint_button.label = "Exit Editing Mode"
                 gui_generate_button.disabled = True
-                gui_generate_button.label = "Generate Disabled In Editing Mode"
+                gui_generate_button.label = (
+                    "Generation Disabled In Editing Mode" if not playback_only else "Generation Disabled"
+                )
                 if "g1" in session.model_name:
                     gui_gizmo_space_dropdown.value = "Local"
                 gui_gizmo_space_dropdown.disabled = True
@@ -2140,33 +2111,38 @@ def create_gui(
                 gui_viz_skinned_mesh_checkbox.value = True
                 gui_viz_skeleton_checkbox.value = True
 
-                # need gizmos for root translation and individual joints
-                def _on_root2d_gizmo_release():
-                    if "2D Root" in session.constraints and session.constraints["2D Root"].dense_path:
+                handled_custom_edit = False
+                if hasattr(demo, "enter_custom_edit_mode"):
+                    handled_custom_edit = bool(demo.enter_custom_edit_mode(session))
+
+                if not handled_custom_edit:
+                    # need gizmos for root translation and individual joints
+                    def _on_root2d_gizmo_release():
+                        if "2D Root" in session.constraints and session.constraints["2D Root"].dense_path:
+                            mot = list(session.motions.values())[0]
+                            _update_dense_path(mot, session)
+
+                    def _on_gizmo_drag_start():
                         mot = list(session.motions.values())[0]
-                        _update_dense_path(mot, session)
+                        frame_idx = min(session.frame_idx, mot.length - 1)
+                        session.undo_drag_snapshot = {
+                            "frame_idx": frame_idx,
+                            "joints_pos": mot.get_joints_pos(frame_idx),
+                            "joints_rot": mot.get_joints_rot(frame_idx),
+                        }
+                        gui_undo_drag_button.disabled = False
 
-                def _on_gizmo_drag_start():
-                    mot = list(session.motions.values())[0]
-                    frame_idx = min(session.frame_idx, mot.length - 1)
-                    session.undo_drag_snapshot = {
-                        "frame_idx": frame_idx,
-                        "joints_pos": mot.get_joints_pos(frame_idx),
-                        "joints_rot": mot.get_joints_rot(frame_idx),
-                    }
-                    gui_undo_drag_button.disabled = False
-
-                motion.add_root_translation_gizmo(
-                    session.constraints,
-                    on_2d_root_drag_end=_on_root2d_gizmo_release,
-                    on_drag_start=_on_gizmo_drag_start,
-                )
-                gizmo_space = "local" if "g1" in session.model_name else gui_gizmo_space_dropdown.value.lower()
-                motion.add_joint_gizmos(
-                    session.constraints,
-                    space=gizmo_space,
-                    on_drag_start=_on_gizmo_drag_start,
-                )
+                    motion.add_root_translation_gizmo(
+                        session.constraints,
+                        on_2d_root_drag_end=_on_root2d_gizmo_release,
+                        on_drag_start=_on_gizmo_drag_start,
+                    )
+                    gizmo_space = "local" if "g1" in session.model_name else gui_gizmo_space_dropdown.value.lower()
+                    motion.add_joint_gizmos(
+                        session.constraints,
+                        space=gizmo_space,
+                        on_drag_start=_on_gizmo_drag_start,
+                    )
             else:
                 exit_editing_mode(session)
 
@@ -2728,6 +2704,14 @@ def create_gui(
         # generation callback
         @gui_generate_button.on_click
         def _(event: viser.GuiEvent) -> None:
+            if playback_only:
+                event.client.add_notification(
+                    title="Generation disabled",
+                    body="This playback-only mode supports timeline and constraint editing, not motion generation.",
+                    auto_close_seconds=5.0,
+                    color="blue",
+                )
+                return
             event_client = event.client
             session = get_active_session(event_client)
             if session is None:
