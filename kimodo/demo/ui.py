@@ -17,6 +17,7 @@ from kimodo.exports.motion_io import (
     save_kimodo_npz,
 )
 from kimodo.model.registry import kimodo_short_key_for_skeleton_dataset, registry_skeleton_for_joint_count
+from kimodo.skeleton.registry import build_skeleton
 from kimodo.tools import to_torch
 from kimodo.viz import viser_utils
 from kimodo.viz.viser_utils import GuiElements
@@ -794,6 +795,7 @@ def create_gui(
 
                 fps_arg = session.model_fps if session.model_fps and session.model_fps > 0 else None
                 motion_dict, num_joints_motion = load_motion_file(load_path, target_fps=fps_arg)
+                loaded_skeleton = build_skeleton(num_joints_motion)
 
                 target_skel = registry_skeleton_for_joint_count(num_joints_motion)
                 current_info = get_model_info(session.model_name)
@@ -876,7 +878,12 @@ def create_gui(
                 elif joints_rot.shape[1] != num_joints_skeleton:
                     raise ValueError(
                         f"Rotation data has {joints_rot.shape[1]} joints but the current model has "
-                        f"{num_joints_skeleton} joints. The NPZ may be corrupted or from a different skeleton."
+                        f"{num_joints_skeleton} joints. The motion may be corrupted or from a different skeleton."
+                    )
+                elif loaded_skeleton.bone_order_names != session.skeleton.bone_order_names:
+                    raise ValueError(
+                        f"The loaded motion uses skeleton ordering '{loaded_skeleton.name}', but the current model "
+                        f"expects '{session.skeleton.name}'. Switch the model or convert the source motion first."
                     )
 
                 # Apply G1 real robot projection (1-DoF per joint + axis limits) if enabled.

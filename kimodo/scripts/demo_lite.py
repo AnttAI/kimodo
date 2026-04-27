@@ -8,16 +8,14 @@ import argparse
 import threading
 from pathlib import Path
 
-import numpy as np
-import torch
 import viser
 
 from kimodo.constraints import FullBodyConstraintSet, Root2DConstraintSet, TYPE_TO_CLASS
 from kimodo.demo import ui
 from kimodo.demo.config import DEFAULT_PLAYBACK_SPEED, MODEL_EXAMPLES_DIRS
 from kimodo.demo.state import ClientSession
+from kimodo.motion_io import load_motion_file
 from kimodo.skeleton import SkeletonBase
-from kimodo.skeleton.registry import build_skeleton
 from kimodo.viz.playback import CharacterMotion
 from kimodo.viz.scene import Character
 
@@ -33,36 +31,6 @@ class DemoLiteCharacterMotion(CharacterMotion):
             self.character.skeleton_mesh.mesh_info_cache = None
         if self.character.skinned_mesh is not None:
             self.character.skinned_verts_cache = None
-
-
-def _load_motion_npz(path: Path, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, SkeletonBase]:
-    with np.load(path, allow_pickle=False) as data:
-        if "joints_pos" in data:
-            joints_pos = torch.from_numpy(data["joints_pos"]).to(device)
-        elif "posed_joints" in data:
-            joints_pos = torch.from_numpy(data["posed_joints"]).to(device)
-        else:
-            raise ValueError(f"{path}: missing 'joints_pos' or 'posed_joints'")
-
-        if "joints_rot" in data:
-            joints_rot = torch.from_numpy(data["joints_rot"]).to(device)
-        elif "global_rot_mats" in data:
-            joints_rot = torch.from_numpy(data["global_rot_mats"]).to(device)
-        else:
-            raise ValueError(f"{path}: missing 'joints_rot' or 'global_rot_mats'")
-
-        foot_contacts = torch.from_numpy(data["foot_contacts"]).to(device) if "foot_contacts" in data else None
-
-    if joints_pos.ndim == 4:
-        joints_pos = joints_pos[0]
-    if joints_rot.ndim == 5:
-        joints_rot = joints_rot[0]
-    if foot_contacts is not None and foot_contacts.ndim == 3:
-        foot_contacts = foot_contacts[0]
-
-    skeleton = build_skeleton(joints_pos.shape[1])
-    return joints_pos, joints_rot, foot_contacts, skeleton
-
 
 def _model_name_for_skeleton(skeleton: SkeletonBase) -> str:
     if skeleton.nbjoints in (30, 77):
@@ -86,7 +54,9 @@ class DemoLite:
         self.grid_handles = {}
         self.floor_len = 20.0
 
-        self.joints_pos, self.joints_rot, self.foot_contacts, self.skeleton = _load_motion_npz(motion_path, self.device)
+        self.joints_pos, self.joints_rot, self.foot_contacts, self.skeleton = load_motion_file(
+            motion_path, self.device
+        )
         self.model_name = _model_name_for_skeleton(self.skeleton)
         self.model_fps = fps
 
@@ -358,7 +328,7 @@ class DemoLite:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run the Kimodo demo UI in playback-only mode.")
-    parser.add_argument("motion", help="Path to a .npz motion file.")
+    parser.add_argument("motion", help="Path to a motion file (.npz or compatible .bvh).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=7860)
     parser.add_argument("--fps", type=float, default=30.0)

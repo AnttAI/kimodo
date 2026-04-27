@@ -23,9 +23,10 @@ from kimodo.skeleton import SkeletonBase
 from kimodo.viz.playback import CharacterMotion
 from kimodo.viz.scene import Character
 from kimodo.viz.viser_utils import ConstraintSet
+from kimodo.motion_io import load_motion_file
 from kimodo.tools import to_numpy, to_torch
 
-from .demo_lite import DemoLiteCharacterMotion, _load_motion_npz, _model_name_for_skeleton
+from .demo_lite import DemoLiteCharacterMotion, _model_name_for_skeleton
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PYROKI_ROOT = REPO_ROOT / "pyroki"
@@ -438,7 +439,9 @@ class Demo2:
         self.grid_handles = {}
         self.floor_len = 20.0
 
-        self.joints_pos, self.joints_rot, self.foot_contacts, self.skeleton = _load_motion_npz(motion_path, self.device)
+        self.joints_pos, self.joints_rot, self.foot_contacts, self.skeleton = load_motion_file(
+            motion_path, self.device
+        )
         self.model_name = _model_name_for_skeleton(self.skeleton)
         self.model_fps = fps
 
