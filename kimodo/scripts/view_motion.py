@@ -9,7 +9,6 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Sequence
 
 import numpy as np
 import viser
@@ -18,7 +17,7 @@ from kimodo.motion_io import load_motion_file
 from kimodo.skeleton import SkeletonBase
 from kimodo.viz.playback import CharacterMotion
 from kimodo.viz.scene import Character
-from kimodo.viz.tara_rig import TaraViewerMotion
+from kimodo.viz.tara_rig import T2ViewerMotion
 
 
 @dataclass
@@ -69,26 +68,14 @@ def _configure_client_scene(client: viser.ClientHandle) -> None:
 def _scan_motion_pairs(motions_root: Path) -> list[str]:
     bvh_dir = motions_root / "bvh"
     csv_dir = motions_root / "csv"
-    if not bvh_dir.is_dir() or not csv_dir.is_dir():
+    t2_csv_dir = motions_root / "t2_csv"
+    if not bvh_dir.is_dir() or not csv_dir.is_dir() or not t2_csv_dir.is_dir():
         return []
 
     bvh_stems = {path.stem for path in bvh_dir.glob("*.bvh")}
     csv_stems = {path.stem for path in csv_dir.glob("*.csv") if not path.name.endswith(".generated.csv")}
-    return sorted(bvh_stems & csv_stems)
-
-
-def _infer_tara_root(motion_path: Path, motions_root: Path | None, explicit_tara_root: Path | None) -> Path | None:
-    if explicit_tara_root is not None:
-        return explicit_tara_root
-    if motions_root is not None and len(motions_root.parents) >= 2:
-        candidate = motions_root.parents[1] / "tara"
-        if candidate.is_dir():
-            return candidate
-    for parent in motion_path.parents:
-        candidate = parent / "tara"
-        if candidate.is_dir():
-            return candidate
-    return None
+    t2_stems = {path.stem for path in t2_csv_dir.glob("*.csv")}
+    return sorted(bvh_stems & csv_stems & t2_stems)
 
 
 def _resolve_robot_path(robot_path: Path | None) -> Path | None:
@@ -110,23 +97,16 @@ def _resolve_robot_path(robot_path: Path | None) -> Path | None:
 
 
 def _motion_paths_for_stem(motions_root: Path, stem: str) -> list[Path]:
-    paths = [motions_root / "bvh" / f"{stem}.bvh"]
-    t2_csv_path = motions_root / "t2_csv" / f"{stem}.csv"
-    tara_csv_path = motions_root / "tara_csv" / f"{stem}.csv"
-    if t2_csv_path.exists():
-        paths.append(t2_csv_path)
-    elif tara_csv_path.exists():
-        paths.append(tara_csv_path)
-    paths.append(motions_root / "csv" / f"{stem}.csv")
-    return paths
+    return [
+        motions_root / "bvh" / f"{stem}.bvh",
+        motions_root / "t2_csv" / f"{stem}.csv",
+        motions_root / "csv" / f"{stem}.csv",
+    ]
 
 
 def _default_browser_stem(motions_root: Path, options: list[str]) -> str:
     for stem in options:
         if (motions_root / "t2_csv" / f"{stem}.csv").exists():
-            return stem
-    for stem in options:
-        if (motions_root / "tara_csv" / f"{stem}.csv").exists():
             return stem
     return options[0]
 
@@ -142,12 +122,7 @@ def main() -> None:
     parser.add_argument(
         "--motions-root",
         default=None,
-        help="Base folder containing matching bvh/, csv/, and optional t2_csv/ or tara_csv/ subfolders for UI selection.",
-    )
-    parser.add_argument(
-        "--tara-root",
-        default=None,
-        help="Folder containing Tara/T1 MJCF assets such as T1_serial.xml. Only needed without --robot-path.",
+        help="Base folder containing matching bvh/, t2_csv/, and csv/ subfolders for UI selection.",
     )
     parser.add_argument(
         "--robot-path",
@@ -161,7 +136,6 @@ def main() -> None:
         if not path.exists():
             raise FileNotFoundError(path)
     motions_root = Path(args.motions_root).expanduser().resolve() if args.motions_root else None
-    tara_root = Path(args.tara_root).expanduser().resolve() if args.tara_root else None
     robot_path = _resolve_robot_path(Path(args.robot_path)) if args.robot_path else None
     if not motion_paths and motions_root is None:
         raise ValueError("Provide motion paths or --motions-root.")
@@ -249,16 +223,10 @@ def main() -> None:
         for idx, path in enumerate(paths):
             print(f"Loading motion: {path}", flush=True)
             x_offset = (idx - (num_motions - 1) / 2.0) * args.spread if args.spread != 0.0 else 0.0
-            if path.parent.name in {"t2_csv", "tara_csv"}:
-                resolved_tara_root = None
-                if robot_path is None:
-                    resolved_tara_root = _infer_tara_root(path, motions_root, tara_root)
-                    if resolved_tara_root is None:
-                        raise FileNotFoundError(f"Could not infer Tara root for {path}. Pass --tara-root or --robot-path.")
-                motion = TaraViewerMotion(
+            if path.parent.name == "t2_csv":
+                motion = T2ViewerMotion(
                     name=f"motion_{idx}",
                     server=server,
-                    tara_root=resolved_tara_root,
                     csv_path=path,
                     urdf_path=robot_path,
                     x_offset=x_offset,

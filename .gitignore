@@ -158,5 +158,3 @@ onelogger.err
 
 # deploy files
 /helm-library
-
-.DS_Store

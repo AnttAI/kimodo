@@ -164,7 +164,7 @@ class CharacterMotion:
             foot_contacts = to_torch(foot_contacts, device=self.foot_contacts.device).to(dtype=self.foot_contacts.dtype)
             self.foot_contacts[frame_idx] = foot_contacts
 
-        if self.character.skeleton_mesh is not None and self.character.skeleton_mesh.mesh_info_cache is not None:
+        if self.character.skeleton_mesh is not None:
             self.character.skeleton_mesh.update_mesh_info_cache(self.joints_pos[frame_idx], frame_idx)
         if self.character.skinned_mesh is not None:
             self.character.update_skinning_cache(self.joints_pos[frame_idx], self.joints_rot[frame_idx], frame_idx)

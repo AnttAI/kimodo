@@ -71,19 +71,12 @@ target_compile_definitions(motion_correction_cpp_base PUBLIC EIGEN_MPL2_ONLY)
 
 # Compiler-specific settings
 if(MSVC)
-    # Only request AVX on x86/x64 MSVC targets. ARM builds do not support these flags.
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|i[3-6]86)$")
-        target_compile_options(motion_correction_cpp_base PRIVATE /W4 /arch:AVX)
-    else()
-        target_compile_options(motion_correction_cpp_base PRIVATE /W4)
-    endif()
+    # MSVC-specific flags
+    target_compile_options(motion_correction_cpp_base PRIVATE /W4 /arch:AVX)
 else()
-    # GCC/Clang flags (also applies to MinGW on Windows).
-    # SSE4.1/AVX are x86-specific and break Apple Silicon builds.
-    target_compile_options(motion_correction_cpp_base PRIVATE -Wall -Wextra)
-    if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|amd64|i[3-6]86)$")
-        target_compile_options(motion_correction_cpp_base PRIVATE -msse4.1 -mavx)
-    endif()
+    # GCC/Clang flags (also applies to MinGW on Windows)
+    # Enable SSE4.1 and AVX instructions for SIMD operations
+    target_compile_options(motion_correction_cpp_base PRIVATE -Wall -Wextra -msse4.1 -mavx)
 endif()
 
 # Python bindings

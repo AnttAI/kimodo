@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import os
-import platform
 import shutil
 import subprocess
 import sys
@@ -100,15 +99,6 @@ kimodo_packages = find_packages(include=["kimodo", "kimodo.*"])
 # When set (e.g. in Docker), do not bundle motion_correction here; it is installed
 # separately (e.g. from docker_requirements.txt as ./MotionCorrection) non-editable.
 skip_motion_correction = os.environ.get("SKIP_MOTION_CORRECTION_IN_SETUP", "").strip().lower() in ("1", "true", "yes")
-arch = platform.machine().lower()
-motion_correction_supported_arch = arch in ("x86_64", "amd64", "i386", "i686")
-
-if not skip_motion_correction and not motion_correction_supported_arch:
-    print(
-        f"Skipping MotionCorrection build on unsupported architecture '{arch}'. "
-        "Set SKIP_MOTION_CORRECTION_IN_SETUP=0 on a supported x86/x64 machine to enable it."
-    )
-    skip_motion_correction = True
 
 if skip_motion_correction:
     packages = kimodo_packages
