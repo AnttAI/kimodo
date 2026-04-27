@@ -49,7 +49,7 @@ def _load_motion_npz(path: Path, device: str) -> tuple[torch.Tensor, torch.Tenso
 
 
 def _load_motion_bvh(path: Path, device: str) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None, SkeletonBase]:
-    local_rot_mats, root_trans = parse_bvh_motion(str(path))
+    local_rot_mats, root_trans, _fps = parse_bvh_motion(str(path))
     skeleton = build_skeleton(local_rot_mats.shape[1]).to(device)
 
     # BVH local rotations are authored in the source BVH rest-pose convention.
