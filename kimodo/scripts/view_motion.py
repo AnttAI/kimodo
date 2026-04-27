@@ -236,19 +236,19 @@ def main() -> None:
                 if x_offset != 0.0:
                     joints_pos = joints_pos.clone()
                     joints_pos[..., 0] += x_offset
-                is_g1 = skeleton.nbjoints == 34
+                mesh_mode = _infer_mesh_mode(skeleton)
                 character = Character(
                     name=f"motion_{idx}",
                     server=server,
                     skeleton=skeleton,
                     create_skeleton_mesh=True,
-                    create_skinned_mesh=is_g1,
+                    create_skinned_mesh=True,
                     visible_skeleton=skeleton_checkbox.value,
-                    visible_skinned_mesh=mesh_checkbox.value and is_g1,
+                    visible_skinned_mesh=mesh_checkbox.value,
                     skinned_mesh_opacity=opacity_slider.value,
                     show_foot_contacts=contacts_checkbox.value,
                     dark_mode=False,
-                    mesh_mode=_infer_mesh_mode(skeleton),
+                    mesh_mode=mesh_mode,
                 )
                 motion = ViewerCharacterMotion(character, joints_pos, joints_rot, foot_contacts)
             motion.set_frame(0)
