@@ -67,15 +67,13 @@ def _configure_client_scene(client: viser.ClientHandle) -> None:
 
 def _scan_motion_pairs(motions_root: Path) -> list[str]:
     bvh_dir = motions_root / "bvh"
-    csv_dir = motions_root / "csv"
     t2_csv_dir = motions_root / "t2_csv"
-    if not bvh_dir.is_dir() or not csv_dir.is_dir() or not t2_csv_dir.is_dir():
+    if not bvh_dir.is_dir() or not t2_csv_dir.is_dir():
         return []
 
-    bvh_stems = {path.stem for path in bvh_dir.glob("*.bvh")}
-    csv_stems = {path.stem for path in csv_dir.glob("*.csv") if not path.name.endswith(".generated.csv")}
-    t2_stems = {path.stem for path in t2_csv_dir.glob("*.csv")}
-    return sorted(bvh_stems & csv_stems & t2_stems)
+    bvh_stems = {str(path.relative_to(bvh_dir).with_suffix("")) for path in bvh_dir.rglob("*.bvh")}
+    t2_stems = {str(path.relative_to(t2_csv_dir).with_suffix("")) for path in t2_csv_dir.rglob("*.csv")}
+    return sorted(bvh_stems & t2_stems)
 
 
 def _resolve_robot_path(robot_path: Path | None) -> Path | None:
@@ -97,18 +95,24 @@ def _resolve_robot_path(robot_path: Path | None) -> Path | None:
 
 
 def _motion_paths_for_stem(motions_root: Path, stem: str) -> list[Path]:
-    return [
-        motions_root / "bvh" / f"{stem}.bvh",
-        motions_root / "t2_csv" / f"{stem}.csv",
-        motions_root / "csv" / f"{stem}.csv",
+    relative_stem = Path(stem)
+    candidates = [
+        motions_root / "bvh" / relative_stem.with_suffix(".bvh"),
+        motions_root / "t2_csv" / relative_stem.with_suffix(".csv"),
+        motions_root / "csv" / relative_stem.with_suffix(".csv"),
     ]
+    return [path for path in candidates if path.exists()]
 
 
 def _default_browser_stem(motions_root: Path, options: list[str]) -> str:
     for stem in options:
-        if (motions_root / "t2_csv" / f"{stem}.csv").exists():
+        if _motion_paths_for_stem(motions_root, stem)[1].exists():
             return stem
     return options[0]
+
+
+def _is_t2_csv_path(path: Path) -> bool:
+    return "t2_csv" in path.parts
 
 
 def main() -> None:
@@ -128,6 +132,11 @@ def main() -> None:
         "--robot-path",
         default=None,
         help="Robot URDF file, or a folder containing exactly one robot URDF.",
+    )
+    parser.add_argument(
+        "--t2-arms-only",
+        action="store_true",
+        help="For T2 CSV playback, apply only arm and gripper joints from CSV; keep root and other joints static.",
     )
     args = parser.parse_args()
 
@@ -223,13 +232,14 @@ def main() -> None:
         for idx, path in enumerate(paths):
             print(f"Loading motion: {path}", flush=True)
             x_offset = (idx - (num_motions - 1) / 2.0) * args.spread if args.spread != 0.0 else 0.0
-            if path.parent.name == "t2_csv":
+            if _is_t2_csv_path(path):
                 motion = T2ViewerMotion(
                     name=f"motion_{idx}",
                     server=server,
                     csv_path=path,
                     urdf_path=robot_path,
                     x_offset=x_offset,
+                    arms_only=args.t2_arms_only,
                 )
             else:
                 joints_pos, joints_rot, foot_contacts, skeleton = load_motion_file(path, args.device)
@@ -343,10 +353,14 @@ def main() -> None:
                 )
                 return
             motion_set_paths = _motion_paths_for_stem(root, stem)
-            if not motion_set_paths[0].exists() or not motion_set_paths[1].exists():
+            required_paths = [
+                root / "bvh" / Path(stem).with_suffix(".bvh"),
+                root / "t2_csv" / Path(stem).with_suffix(".csv"),
+            ]
+            if not required_paths[0].exists() or not required_paths[1].exists():
                 _event.client.add_notification(
                     title="Motion set missing",
-                    body=f"Expected both {stem}.bvh and {stem}.csv.",
+                    body=f"Expected both bvh/{stem}.bvh and t2_csv/{stem}.csv.",
                     auto_close_seconds=4.0,
                     color="red",
                 )

@@ -122,6 +122,27 @@ _TARA_URDF_NEUTRAL_JOINTS = {
     "right_joint6": 0.8,
 }
 
+_TARA_ARM_JOINT_NAMES = {
+    "right_joint1",
+    "right_joint2",
+    "right_joint3",
+    "right_joint4",
+    "right_joint5",
+    "right_joint6",
+    "right_joint7",
+    "right_gripper_joint1",
+    "right_gripper_joint2",
+    "left_joint1",
+    "left_joint2",
+    "left_joint3",
+    "left_joint4",
+    "left_joint5",
+    "left_joint6",
+    "left_joint7",
+    "left_gripper_joint1",
+    "left_gripper_joint2",
+}
+
 
 @dataclass
 class TaraMotionData:
@@ -277,6 +298,7 @@ class T2ViewerMotion:
         urdf_path: str | Path | None = None,
         x_offset: float = 0.0,
         color: tuple[int, int, int] = (160, 160, 160),
+        arms_only: bool = False,
     ):
         repo_root = Path(__file__).resolve().parents[3]
         preferred_urdf_path = (
@@ -296,6 +318,7 @@ class T2ViewerMotion:
             color=color,
         )
         self.motion = load_tara_motion_csv(csv_path, x_offset=x_offset)
+        self.arms_only = arms_only
         self.rig.ground_from_frame0(self.motion.root_positions[0])
         self.length = self.motion.length
         self.cur_frame_idx = 0
@@ -303,9 +326,12 @@ class T2ViewerMotion:
     def set_frame(self, idx: int) -> None:
         idx = min(int(idx), self.length - 1)
         joint_angles = {joint_name: values[idx] for joint_name, values in self.motion.joint_angles.items()}
+        root_idx = 0 if self.arms_only else idx
+        if self.arms_only:
+            joint_angles = {name: value for name, value in joint_angles.items() if name in _TARA_ARM_JOINT_NAMES}
         self.rig.set_pose(
-            root_pos=self.motion.root_positions[idx],
-            root_rot=self.motion.root_rotations[idx],
+            root_pos=self.motion.root_positions[root_idx],
+            root_rot=self.motion.root_rotations[root_idx],
             joint_angles=joint_angles,
         )
         self.cur_frame_idx = idx
