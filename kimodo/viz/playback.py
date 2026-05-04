@@ -64,6 +64,25 @@ class CharacterMotion:
         self._drag_start_world_rot: list = []
         self._joint_gizmo_dragging: list[bool] = []
 
+    def _sync_joint_gizmo_tracking(self) -> None:
+        """Keep per-gizmo drag state aligned with the currently mounted gizmos."""
+
+        if self.joint_gizmos is None:
+            self._drag_start_world_rot = []
+            self._joint_gizmo_dragging = []
+            return
+
+        target_len = len(self.joint_gizmos)
+        if len(self._joint_gizmo_dragging) < target_len:
+            self._joint_gizmo_dragging.extend([False] * (target_len - len(self._joint_gizmo_dragging)))
+        elif len(self._joint_gizmo_dragging) > target_len:
+            self._joint_gizmo_dragging = self._joint_gizmo_dragging[:target_len]
+
+        if len(self._drag_start_world_rot) < target_len:
+            self._drag_start_world_rot.extend([None] * (target_len - len(self._drag_start_world_rot)))
+        elif len(self._drag_start_world_rot) > target_len:
+            self._drag_start_world_rot = self._drag_start_world_rot[:target_len]
+
     def precompute_mesh_info(self):
         if self.character.skeleton_mesh is not None:
             print("Caching skeleton mesh info...")
@@ -90,7 +109,9 @@ class CharacterMotion:
         if self.root_translation_gizmo is not None and not self.updating_root_translation_gizmo:
             self.root_translation_gizmo.position = cur_root_pos.cpu().numpy()
         if self.joint_gizmos is not None:
-            for i, joint_gizmo in enumerate(self.joint_gizmos):
+            self._sync_joint_gizmo_tracking()
+            max_joint_idx = min(len(self.joint_gizmos), self.joints_pos.shape[1], self.joints_rot.shape[1])
+            for i, joint_gizmo in enumerate(self.joint_gizmos[:max_joint_idx]):
                 # Do not push wxyz/position while this gizmo is being dragged;
                 # otherwise the client receives e.g. identity and the gizmo snaps back.
                 if not self.updating_joint_gizmos and not self._joint_gizmo_dragging[i]:
@@ -170,6 +191,7 @@ class CharacterMotion:
             self.character.update_skinning_cache(self.joints_pos[frame_idx], self.joints_rot[frame_idx], frame_idx)
 
     def clear(self):
+        self.clear_all_gizmos()
         self.character.clear()
 
     #
