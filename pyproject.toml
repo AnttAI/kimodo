@@ -50,6 +50,7 @@ kimodo_demo = "kimodo.demo:main"
 kimodo_textencoder = "kimodo.scripts.run_text_encoder_server:main"
 kimodo_convert = "kimodo.scripts.motion_convert:main"
 kimodo_view = "kimodo.scripts.view_motion:main"
+kimodo_robot_demo = "kimodo.demo.robot_app:main"
 
 [tool.setuptools]
 include-package-data = true
