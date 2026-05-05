@@ -25,7 +25,6 @@ from kimodo.demo.app import Demo
 from kimodo.demo.config import DEFAULT_MODEL
 from kimodo.exports.bvh import read_bvh_frame_time_seconds, save_motion_bvh
 from kimodo.exports.motion_io import save_kimodo_npz
-from kimodo.gemx import GemxVideoToBvhJob, default_gemx_root
 from kimodo.model.registry import DEFAULT_TEXT_ENCODER_URL, resolve_model_name
 from kimodo.motion_io import load_motion_file
 from kimodo.retarget.soma_t2 import SomaT2RetargetJob, default_soma_retargeter_root
@@ -36,7 +35,6 @@ from kimodo.viz.tara_rig import T2ViewerMotion
 
 MEMORIES_ROOT = Path("/home/jony/important/soma-retargeter/assets/motions")
 TEXT_ENCODER_SERVER_COMMAND = "python -m kimodo.scripts.run_text_encoder_server"
-VIDEO_SUFFIXES = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4v"}
 
 
 def _configure_text_encoder_runtime(text_encoder_mode: str | None, text_encoder_url: str | None) -> str:
@@ -174,7 +172,6 @@ class RobotWorkflowState:
     status_markdown: viser.GuiMarkdownHandle | None = None
     robot_markdown: viser.GuiMarkdownHandle | None = None
     retarget_running: bool = False
-    gemx_running: bool = False
 
     def clear_t2_preview(self) -> None:
         if self.t2_motion is not None:
@@ -255,35 +252,6 @@ class RobotDemo(Demo):
                 color="blue",
                 hint="Save the current SOMA motion into the BVH memories folder.",
             )
-
-        with client.gui.add_folder("GEMx", expand_by_default=True):
-            gemx_status = client.gui.add_markdown("No GEMx video selected.")
-            gemx_video_path_text = client.gui.add_text(
-                "Video",
-                initial_value="",
-                hint="Path to a local video file, or use Upload Video.",
-            )
-            gemx_upload_button = client.gui.add_upload_button(
-                "Upload Video",
-                mime_type="video/*",
-                hint="Upload a video from this browser session.",
-            )
-            gemx_run_button = client.gui.add_button("Run GEMx", color="green")
-
-            with client.gui.add_folder("GEMx Runtime", expand_by_default=False):
-                gemx_root_text = client.gui.add_text("GEM-X Root", initial_value=str(default_gemx_root()))
-                gemx_conda_env_text = client.gui.add_text("Conda Env", initial_value="gemx")
-                gemx_ckpt_path_text = client.gui.add_text(
-                    "Checkpoint",
-                    initial_value=str(default_gemx_root() / "inputs" / "pretrained" / "gem_soma.ckpt"),
-                )
-                gemx_static_cam_checkbox = client.gui.add_checkbox("Static camera", initial_value=True)
-                gemx_detector_dropdown = client.gui.add_dropdown(
-                    "Detector",
-                    options=["vitdet", "sam3", "<skip>"],
-                    initial_value="vitdet",
-                )
-                gemx_render_checkbox = client.gui.add_checkbox("Render videos", initial_value=False)
 
         with client.gui.add_folder("Sync to Real Robot", expand_by_default=True):
             workflow.robot_markdown = client.gui.add_markdown("Disconnected.")
@@ -553,140 +521,6 @@ class RobotDemo(Demo):
                 f"`{csv_path}`\n\n"
                 f"{_csv_motion_summary(csv_path)}"
             )
-
-        def update_gemx_status(message: str) -> None:
-            gemx_status.content = message
-
-        def uploaded_video_path(uploaded_name: str) -> Path:
-            suffix = Path(uploaded_name).suffix.lower()
-            if suffix not in VIDEO_SUFFIXES:
-                suffix = ".mp4"
-            stem = _safe_clip_name(Path(uploaded_name).stem)
-            upload_dir = current_memories_root() / ".kimodo_gemx_uploads"
-            upload_dir.mkdir(parents=True, exist_ok=True)
-            return upload_dir / f"{uuid.uuid4().hex[:8]}_{stem}{suffix}"
-
-        @gemx_upload_button.on_upload
-        def _(event: viser.GuiEvent) -> None:
-            uploaded = gemx_upload_button.value
-            if not uploaded.content:
-                event.client.add_notification(
-                    title="GEMx upload failed",
-                    body="The uploaded file was empty.",
-                    auto_close_seconds=5.0,
-                    color="red",
-                )
-                return
-
-            try:
-                upload_path = uploaded_video_path(uploaded.name)
-                upload_path.write_bytes(uploaded.content)
-                gemx_video_path_text.value = str(upload_path)
-                update_gemx_status(f"Selected video:\n\n`{upload_path}`")
-                event.client.add_notification(
-                    title="GEMx video uploaded",
-                    body=str(upload_path),
-                    auto_close_seconds=4.0,
-                    color="green",
-                )
-            except Exception as exc:
-                event.client.add_notification(
-                    title="GEMx upload failed",
-                    body=str(exc),
-                    auto_close_seconds=7.0,
-                    color="red",
-                )
-
-        @gemx_run_button.on_click
-        def _(event: viser.GuiEvent) -> None:
-            if workflow.gemx_running:
-                event.client.add_notification(
-                    title="GEMx already running",
-                    body="Wait for the current GEMx conversion to finish.",
-                    auto_close_seconds=4.0,
-                    color="orange",
-                )
-                return
-
-            session = self.client_sessions[client.client_id]
-            if "soma" not in session.model_name.lower():
-                event.client.add_notification(
-                    title="GEMx needs a SOMA model",
-                    body="Select a Kimodo-SOMA model before converting video to BVH.",
-                    auto_close_seconds=6.0,
-                    color="red",
-                )
-                return
-
-            video_path = Path(gemx_video_path_text.value).expanduser().resolve()
-            detector_name = str(gemx_detector_dropdown.value)
-            if detector_name == "<skip>":
-                detector_name = ""
-            ckpt_value = str(gemx_ckpt_path_text.value).strip()
-            ckpt_path = Path(ckpt_value).expanduser().resolve() if ckpt_value else None
-            job = GemxVideoToBvhJob(
-                gemx_root=Path(gemx_root_text.value).expanduser().resolve(),
-                video_path=video_path,
-                conda_env=str(gemx_conda_env_text.value).strip() or "gemx",
-                ckpt_path=ckpt_path,
-                static_cam=bool(gemx_static_cam_checkbox.value),
-                detector_name=detector_name,
-                skip_render=not bool(gemx_render_checkbox.value),
-            )
-
-            workflow.gemx_running = True
-            gemx_run_button.disabled = True
-            update_gemx_status(f"Running GEMx:\n\n`{video_path}`")
-            gemx_notif = event.client.add_notification(
-                title="GEMx conversion started",
-                body="GEMx is running video-to-BVH conversion.",
-                loading=True,
-                with_close_button=False,
-            )
-
-            def run_job() -> None:
-                try:
-                    result = job.run()
-                    log_path = current_memories_root() / "logs" / "gemx" / job.log_name
-                    log_path.parent.mkdir(parents=True, exist_ok=True)
-                    log_path.write_text(result.stdout or "", encoding="utf-8")
-                    if result.returncode != 0:
-                        raise RuntimeError(f"GEMx failed with exit code {result.returncode}. Log: {log_path}")
-                    if not job.bvh_path.is_file():
-                        raise FileNotFoundError(f"Expected GEMx BVH was not created: {job.bvh_path}")
-
-                    load_bvh_memory(job.bvh_path)
-                    workflow.clear_t2_preview()
-                    workflow.bvh_path = None
-                    workflow.npz_path = None
-                    workflow.csv_path = None
-                    csv_path_text.value = ""
-                    clip_name_text.value = f"gemx_{job.video_name}"
-                    update_gemx_status(
-                        "GEMx BVH loaded into Kimodo:\n\n"
-                        f"`{job.bvh_path}`\n\n"
-                        "Use Memories -> Save Memories to persist it."
-                    )
-                    update_status(f"Loaded GEMx BVH as current SOMA motion:\n\n`{job.bvh_path}`")
-                    gemx_notif.title = "GEMx conversion finished"
-                    gemx_notif.body = str(job.bvh_path)
-                    gemx_notif.loading = False
-                    gemx_notif.with_close_button = True
-                    gemx_notif.auto_close_seconds = 6.0
-                    gemx_notif.color = "green"
-                except Exception as exc:
-                    update_gemx_status(f"GEMx failed:\n\n`{exc}`")
-                    gemx_notif.title = "GEMx conversion failed"
-                    gemx_notif.body = str(exc)
-                    gemx_notif.loading = False
-                    gemx_notif.with_close_button = True
-                    gemx_notif.auto_close_seconds = 9.0
-                    gemx_notif.color = "red"
-                finally:
-                    workflow.gemx_running = False
-                    gemx_run_button.disabled = False
-
-            threading.Thread(target=run_job, daemon=True).start()
 
         @arms_only_checkbox.on_update
         def _(event: viser.GuiEvent) -> None:
