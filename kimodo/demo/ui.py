@@ -2969,7 +2969,7 @@ def create_gui(
     #
     with tab_group.add_tab("Visualize", viser.Icon.EYE):
         with client.gui.add_folder("Playback", expand_by_default=True):
-            gui_model_fps = client.gui.add_number("Model FPS", initial_value=model_fps, disabled=True)
+            gui_model_fps = client.gui.add_number("Model FPS", initial_value=model_fps, min=1, max=120, step=1)
             gui_playback_speed_buttons = client.gui.add_button_group(
                 "Playback Speed",
                 options=[
@@ -3046,6 +3046,15 @@ def create_gui(
                 }
                 session = demo.client_sessions[client_id]
                 session.playback_speed = speed_map[gui_playback_speed_buttons.value]
+
+            @gui_model_fps.on_update
+            def _(_) -> None:
+                if not demo.client_active(client_id):
+                    return
+                new_fps = max(1.0, float(gui_model_fps.value))
+                session = demo.client_sessions[client_id]
+                session.model_fps = new_fps
+                client.timeline.set_fps(new_fps)
 
         with client.gui.add_folder("Body options", expand_by_default=True):
             gui_viz_skinned_mesh_checkbox = client.gui.add_checkbox("Show Mesh", initial_value=True)
