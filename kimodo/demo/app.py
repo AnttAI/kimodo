@@ -25,7 +25,7 @@ from kimodo.viz.viser_utils import (
     FullbodyKeyframeSet,
     RootKeyframe2DSet,
 )
-from viser.theme import TitlebarButton, TitlebarConfig, TitlebarImage
+from viser.theme import TitlebarConfig, TitlebarImage
 
 from . import generation, ui
 from .config import (
@@ -641,26 +641,10 @@ class Demo:
         #
         # setup theme
         #
-        buttons = (
-            TitlebarButton(
-                text="Documentation",
-                icon="Description",
-                href="https://research.nvidia.com/labs/sil/projects/kimodo/docs/interactive_demo/index.html",
-            ),
-            TitlebarButton(
-                text="Project Page",
-                icon=None,
-                href="https://research.nvidia.com/labs/sil/projects/kimodo/",
-            ),
-            TitlebarButton(
-                text="Github",
-                icon="GitHub",
-                href="https://github.com/nv-tlabs/kimodo",
-            ),
-        )
+        buttons = None
         assets_dir = DEMO_ASSETS_ROOT
-        logo_light_path = assets_dir / "nvidia_logo.png"
-        logo_dark_path = assets_dir / "nvidia_logo_dark.png"
+        logo_light_path = assets_dir / "antt_logo.svg"
+        logo_dark_path = assets_dir / "antt_logo_dark.svg"
         if logo_light_path.exists():
             light_b64 = base64.standard_b64encode(logo_light_path.read_bytes()).decode("ascii")
             dark_b64 = (
@@ -669,15 +653,15 @@ class Demo:
                 else None
             )
             image = TitlebarImage(
-                image_url_light=f"data:image/png;base64,{light_b64}",
-                image_url_dark=(f"data:image/png;base64,{dark_b64}" if dark_b64 else None),
-                image_alt="NVIDIA",
-                href="https://www.nvidia.com/",
+                image_url_light=f"data:image/svg+xml;base64,{light_b64}",
+                image_url_dark=(f"data:image/svg+xml;base64,{dark_b64}" if dark_b64 else None),
+                image_alt="Antt AI",
+                href="https://antt.ai/",
             )
         else:
             image = None
-        titlebar_theme = TitlebarConfig(buttons=buttons, image=image, title_text="Kimodo")
-        client.gui.set_panel_label("Kimodo")
+        titlebar_theme = TitlebarConfig(buttons=buttons, image=image, title_text="")
+        client.gui.set_panel_label("Control panel")
         client.gui.configure_theme(
             titlebar_content=titlebar_theme,
             control_layout="floating",  # "floating",  # ['floating', 'collapsible', 'fixed']

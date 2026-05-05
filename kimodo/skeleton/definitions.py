@@ -252,7 +252,7 @@ class SOMASkeleton30(SkeletonBase):
         local_joint_rots_mats = self.somaskel77.relaxed_hands_rest_pose.clone().to(device).repeat(nF, 1, 1, 1)
 
         skel_slice = self.get_skel_slice(self.somaskel77)
-        local_joint_rots_mats[:, skel_slice] = local_joint_rots_subset
+        local_joint_rots_mats[:, skel_slice] = local_joint_rots_subset.to(local_joint_rots_mats.dtype)
         return local_joint_rots_mats
 
     @ensure_batched(local_joint_rots_full=4) # [BT, J, 3, 3]
