@@ -297,6 +297,7 @@ class T2ViewerMotion:
         csv_path: str | Path,
         urdf_path: str | Path | None = None,
         x_offset: float = 0.0,
+        position_offset: np.ndarray | None = None,
         color: tuple[int, int, int] = (160, 160, 160),
         arms_only: bool = False,
     ):
@@ -318,6 +319,8 @@ class T2ViewerMotion:
             color=color,
         )
         self.motion = load_tara_motion_csv(csv_path, x_offset=x_offset)
+        if position_offset is not None:
+            self.motion.root_positions = self.motion.root_positions + np.asarray(position_offset, dtype=np.float64)
         self.arms_only = arms_only
         self.rig.ground_from_frame0(self.motion.root_positions[0])
         self.length = self.motion.length

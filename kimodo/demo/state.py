@@ -37,6 +37,7 @@ class ClientSession:
     timeline_data: object = None
     frame_idx: int = 0
     playing: bool = False
+    play_once: bool = False
     playback_speed: float = DEFAULT_PLAYBACK_SPEED
     cur_duration: float = DEFAULT_CUR_DURATION
     max_frame_idx: int = 100  # will be updated based on model_fps

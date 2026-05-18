@@ -1,0 +1,20 @@
+{
+  "name": "local",
+  "interface": {
+    "displayName": "Local Plugins"
+  },
+  "plugins": [
+    {
+      "name": "antt-ai",
+      "source": {
+        "source": "local",
+        "path": "./plugins/antt-ai"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Robotics"
+    }
+  ]
+}

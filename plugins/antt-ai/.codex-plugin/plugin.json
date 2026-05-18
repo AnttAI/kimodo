@@ -1,0 +1,37 @@
+{
+  "name": "antt-ai",
+  "version": "0.1.0",
+  "description": "Kimodo robot control skills for loading motion memories and world scenes.",
+  "author": {
+    "name": "antt.ai"
+  },
+  "license": "UNLICENSED",
+  "keywords": [
+    "kimodo",
+    "robot",
+    "memory",
+    "world-scene",
+    "viser"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "antt.ai",
+    "shortDescription": "Load Kimodo robot memories and worlds.",
+    "longDescription": "antt.ai bundles Kimodo control skills that let Codex choose between loading robot motion memories and loading world scenes through a shared Kimodo controller URL.",
+    "developerName": "antt.ai",
+    "category": "Robotics",
+    "capabilities": [
+      "Read",
+      "Interactive",
+      "Network"
+    ],
+    "defaultPrompt": [
+      "Load the switch-on memory.",
+      "Load the office world.",
+      "Check Kimodo controller status."
+    ],
+    "brandColor": "#2563EB",
+    "composerIcon": "./assets/antt-ai-logo.jpg",
+    "logo": "./assets/antt-ai-logo.jpg"
+  }
+}
