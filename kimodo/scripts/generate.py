@@ -10,7 +10,7 @@ import torch
 
 from kimodo import DEFAULT_MODEL, load_model
 from kimodo.constraints import load_constraints_lst
-from kimodo.exports.motion_io import save_kimodo_npz
+from kimodo.exports.motion_io import complete_motion_dict, motion_dict_to_numpy, save_kimodo_npz
 from kimodo.meta import load_prompts_from_meta
 from kimodo.model.cfg import CFG_TYPES
 from kimodo.model.registry import get_model_info
@@ -88,6 +88,17 @@ def parse_args():
         help="If exporting BVH, export with the rest pose being the standard T-pose rather than the rest pose consistent with the BONES-SEED dataset.",
     )
     parser.add_argument(
+        "--lock-soma-waist",
+        action="store_true",
+        help="For SOMA outputs, keep Spine1 and Spine2 local rotations fixed for the whole motion.",
+    )
+    parser.add_argument(
+        "--soma-waist-lock-source",
+        choices=("first-frame", "identity"),
+        default="first-frame",
+        help="Rotation to use with --lock-soma-waist. Defaults to the generated first frame.",
+    )
+    parser.add_argument(
         "--no-postprocess",
         action="store_true",
         help="Don't apply motion post-processing to reduce foot skating (ignored for G1)",
@@ -129,6 +140,12 @@ def parse_args():
 
 
 def get_texts_and_num_frames_from_prompt(prompt: str, duration: str, fps: float):
+    if prompt.strip() == "":
+        durations = duration.split()
+        if len(durations) > 1:
+            raise ValueError("Empty prompt generation expects a single duration.")
+        return [""], [int(float(duration) * fps)]
+
     # Get the texts
     texts = [text.strip() for text in prompt.split(".")]
     texts = [text + "." for text in texts if text]
@@ -236,10 +253,49 @@ def resolve_cfg_kwargs(args: argparse.Namespace, meta: Optional[Dict[str, Any]])
     return {}
 
 
+def lock_soma_waist(output: Dict[str, Any], skeleton, fps: float, device: str, source: str) -> Dict[str, Any]:
+    """Lock SOMA waist/spine local rotations and rebuild derived motion arrays."""
+    if "somaskel" not in skeleton.name:
+        raise ValueError("--lock-soma-waist is only supported for SOMA models.")
+
+    joint_names = ("Spine1", "Spine2")
+    missing = [name for name in joint_names if name not in skeleton.bone_index]
+    if missing:
+        raise ValueError(f"SOMA skeleton is missing waist joints: {', '.join(missing)}")
+
+    local_rot_mats = torch.as_tensor(output["local_rot_mats"], device=device).clone()
+    root_positions = torch.as_tensor(output["root_positions"], device=device)
+    if local_rot_mats.dim() != 5:
+        raise ValueError(f"Expected batched local_rot_mats with shape (B,T,J,3,3), got {tuple(local_rot_mats.shape)}")
+    if root_positions.dim() != 3:
+        raise ValueError(f"Expected batched root_positions with shape (B,T,3), got {tuple(root_positions.shape)}")
+
+    joint_indices = torch.tensor([skeleton.bone_index[name] for name in joint_names], device=device)
+    if source == "first-frame":
+        locked_rots = local_rot_mats[:, :1, joint_indices].clone()
+    elif source == "identity":
+        eye = torch.eye(3, device=device, dtype=local_rot_mats.dtype)
+        locked_rots = eye.expand(local_rot_mats.shape[0], 1, len(joint_indices), 3, 3).clone()
+    else:
+        raise ValueError(f"Unsupported SOMA waist lock source: {source}")
+
+    local_rot_mats[:, :, joint_indices] = locked_rots.expand(-1, local_rot_mats.shape[1], -1, -1, -1)
+
+    rebuilt_samples = [
+        complete_motion_dict(local_rot_mats[i], root_positions[i], skeleton, fps)
+        for i in range(local_rot_mats.shape[0])
+    ]
+    rebuilt = {
+        key: torch.stack([sample[key] for sample in rebuilt_samples], dim=0)
+        for key in rebuilt_samples[0]
+    }
+    return motion_dict_to_numpy(rebuilt)
+
+
 def get_generation_inputs(args, fps: float):
     """Get texts/num_frames and parameter overrides from either CLI or input_folder."""
     if args.input_folder is None:
-        if not args.prompt:
+        if args.prompt is None:
             raise ValueError("Either provide 'prompt' or '--input_folder'.")
         texts, num_frames = get_texts_and_num_frames_from_prompt(args.prompt, args.duration, fps)
         return {
@@ -336,6 +392,20 @@ def main():
         return_numpy=True,
         **cfg_kwargs,
     )
+
+    if args.lock_soma_waist:
+        output_skeleton = model.output_skeleton.to(device)
+        print(
+            "Locking SOMA waist joints Spine1 and Spine2 "
+            f"using {args.soma_waist_lock_source!r} rotations"
+        )
+        output = lock_soma_waist(
+            output,
+            output_skeleton,
+            model.fps,
+            device,
+            args.soma_waist_lock_source,
+        )
 
     n_samples = int(output["posed_joints"].shape[0])
     # Parse the output stem once; all formats (NPZ, AMASS NPZ, CSV, BVH) use this base name.

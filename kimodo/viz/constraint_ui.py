@@ -65,11 +65,11 @@ class ConstraintSet:
     def set_label_visibility(self, visible: bool) -> None:
         """Show or hide constraint labels without deleting them."""
         self.labels_visible = visible
-        for scene_data in self.scene_elements.values():
+        for scene_data in list(self.scene_elements.values()):
             label = scene_data.get("label")
             if label is not None:
                 label.visible = visible
-        for interval_label in self.interval_labels.values():
+        for interval_label in list(self.interval_labels.values()):
             interval_label.visible = visible
 
     def set_overlay_visibility(self, only_frame: Optional[int] = None) -> None:
@@ -398,13 +398,13 @@ class FullbodyKeyframeSet(ConstraintSet):
 
     def set_overlay_visibility(self, only_frame: Optional[int] = None) -> None:
         show_all = only_frame is None
-        for fidx, scene_data in self.scene_elements.items():
+        for fidx, scene_data in list(self.scene_elements.items()):
             visible = show_all or fidx == only_frame
             scene_data["skeleton_mesh"].set_visibility(visible)
             label = scene_data.get("label")
             if label is not None:
                 label.visible = visible and self.labels_visible
-        for interval_label in self.interval_labels.values():
+        for interval_label in list(self.interval_labels.values()):
             interval_label.visible = show_all and self.labels_visible
 
 
@@ -742,7 +742,7 @@ class EEJointsKeyframeSet(ConstraintSet):
 
     def set_overlay_visibility(self, only_frame: Optional[int] = None) -> None:
         show_all = only_frame is None
-        for fidx, scene_data in self.scene_elements.items():
+        for fidx, scene_data in list(self.scene_elements.items()):
             visible = show_all or fidx == only_frame
             scene_data["skeleton_mesh"].set_visibility(visible)
             if "ee_rotation_axes" in scene_data:
@@ -750,7 +750,7 @@ class EEJointsKeyframeSet(ConstraintSet):
             label = scene_data.get("label")
             if label is not None:
                 label.visible = visible and self.labels_visible
-        for interval_label in self.interval_labels.values():
+        for interval_label in list(self.interval_labels.values()):
             interval_label.visible = show_all and self.labels_visible
 
 
@@ -1041,6 +1041,7 @@ class RootKeyframe2DSet(ConstraintSet):
 
             self.keyframes.pop(fidx)
             self.scene_elements.pop(fidx)
+            self.frame2keyid.pop(fidx, None)
 
         if frame_idx is None:
             # clear all interval labels if clearing all keyframes
@@ -1059,7 +1060,7 @@ class RootKeyframe2DSet(ConstraintSet):
 
     def set_overlay_visibility(self, only_frame: Optional[int] = None) -> None:
         show_all = only_frame is None
-        for fidx, scene_data in self.scene_elements.items():
+        for fidx, scene_data in list(self.scene_elements.items()):
             visible = show_all or fidx == only_frame
             waypoint = scene_data.get("waypoint")
             if waypoint is not None:
@@ -1069,9 +1070,9 @@ class RootKeyframe2DSet(ConstraintSet):
                 label.visible = visible and self.labels_visible
         if self.line_segments is not None:
             self.line_segments.visible = show_all
-        for line_handle in self.interval_line_segments.values():
+        for line_handle in list(self.interval_line_segments.values()):
             line_handle.visible = show_all
-        for interval_label in self.interval_labels.values():
+        for interval_label in list(self.interval_labels.values()):
             interval_label.visible = show_all and self.labels_visible
 
 

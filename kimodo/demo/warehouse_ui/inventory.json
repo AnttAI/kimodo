@@ -1,0 +1,12 @@
+{
+  "coconut": {"name":"Coconut","rack":"rack1","shelf":1,"stock":15,"weight_grams":1500,"packing_tier":0,"notes":"Very heavy and hard; place at the bottom."},
+  "tomato": {"name":"Tomato","rack":"rack1","shelf":2,"stock":20,"weight_grams":120,"packing_tier":3,"notes":"Crushable; keep above rigid and load-bearing groceries."},
+  "water": {"name":"Water bottle","rack":"rack1","shelf":3,"stock":12,"weight_grams":500,"packing_tier":0,"notes":"Heavy and rigid; place near the bottom."},
+  "potato": {"name":"Potato","rack":"rack1","shelf":4,"stock":20,"weight_grams":250,"packing_tier":0,"notes":"Firm and load-bearing; place below tomatoes and leaves."},
+  "curry_leaves": {"name":"Curry leaves","rack":"rack1","shelf":5,"stock":18,"weight_grams":50,"packing_tier":4,"notes":"Very delicate; place near the top."},
+  "rice": {"name":"Rice packet","rack":"rack2","shelf":1,"stock":16,"weight_grams":1000,"packing_tier":0,"notes":"Heavy sealed packet; place near the bottom."},
+  "red_gram": {"name":"Red gram packet","rack":"rack2","shelf":2,"stock":14,"weight_grams":500,"packing_tier":0,"notes":"Dense sealed packet; place below fragile groceries."},
+  "coke": {"name":"Coke","rack":"rack2","shelf":3,"stock":10,"weight_grams":330,"packing_tier":1,"notes":"Rigid, but should sit above the heaviest items."},
+  "ice_cream": {"name":"Ice cream","rack":"rack2","shelf":4,"stock":8,"weight_grams":50,"packing_tier":5,"notes":"Temperature-sensitive; pick and pack last to reduce melting."},
+  "chips": {"name":"Chips packet","rack":"rack2","shelf":5,"stock":18,"weight_grams":80,"packing_tier":4,"notes":"Crushable packet; keep at the top with delicate items."}
+}

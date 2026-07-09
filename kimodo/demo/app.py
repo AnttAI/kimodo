@@ -222,7 +222,13 @@ class Demo:
 
     def _apply_constraint_overlay_visibility(self, session: ClientSession) -> None:
         """Apply show-all vs show-only-current-frame to constraint overlays."""
-        only_frame = session.frame_idx if session.show_only_current_constraint else None
+        only_frame = (
+            -1
+            if session.hide_constraint_overlays
+            else session.frame_idx
+            if session.show_only_current_constraint
+            else None
+        )
         for constraint in session.constraints.values():
             constraint.set_overlay_visibility(only_frame)
 
@@ -380,6 +386,11 @@ class Demo:
             height=self.floor_len,
             wxyz=viser.transforms.SO3.from_x_radians(-np.pi / 2.0).wxyz,
             position=(0.0, 0.0001, 0.0),
+            cell_color=(120, 120, 120),
+            cell_thickness=0.5,
+            cell_size=0.3,
+            section_size=0.6,
+            section_thickness=1.0,
             fade_distance=3 * self.floor_len,
             section_color=LIGHT_THEME["grid"],
             infinite_grid=True,

@@ -28,7 +28,6 @@ TEXT_ENCODER_PRESETS = {
             "peft_model_name_or_path": "McGill-NLP/LLM2Vec-Meta-Llama-3-8B-Instruct-mntp-supervised",
             "dtype": "bfloat16",
             "llm_dim": 4096,
-            "device": "auto",
         },
     }
 }
@@ -65,29 +64,33 @@ def _build_api_text_encoder_conf(text_encoder_url: str) -> dict:
     }
 
 
-def _build_local_text_encoder_conf(text_encoder_fp32: bool = False) -> dict:
+def _build_local_text_encoder_conf() -> dict:
     text_encoder_name = get_env_var("TEXT_ENCODER", DEFAULT_TEXT_ENCODER)
     if text_encoder_name not in TEXT_ENCODER_PRESETS:
         available = ", ".join(sorted(TEXT_ENCODER_PRESETS))
         raise ValueError(f"Unknown TEXT_ENCODER='{text_encoder_name}'. Available: {available}")
 
     preset = TEXT_ENCODER_PRESETS[text_encoder_name]
-    if text_encoder_fp32:
-        preset["kwargs"]["dtype"] = "float32"
     return {
         "_target_": preset["target"],
         **preset["kwargs"],
     }
 
 
-def _select_text_encoder_conf(text_encoder_url: str, text_encoder_fp32: bool = False) -> dict:
+def _select_text_encoder_conf(text_encoder_url: str) -> dict:
     # TEXT_ENCODER_MODE options:
     # - "api": force TextEncoderAPI
     # - "local": force local LLM2VecEncoder
+    # - "dummy": zero-vector encoder (no LLM needed, constraint-only)
     # - "auto": try API first, fallback to local if unreachable
     mode = get_env_var("TEXT_ENCODER_MODE", "auto").lower()
+    if mode == "dummy":
+        return {
+            "_target_": "kimodo.model.llm2vec.llm2vec_wrapper.DummyTextEncoder",
+            "llm_dim": 4096,
+        }
     if mode == "local":
-        return _build_local_text_encoder_conf(text_encoder_fp32)
+        return _build_local_text_encoder_conf()
     if mode == "api":
         return _build_api_text_encoder_conf(text_encoder_url)
 
@@ -102,17 +105,16 @@ def _select_text_encoder_conf(text_encoder_url: str, text_encoder_fp32: bool = F
             "Text encoder service is unreachable, falling back to local LLM2Vec "
             f"encoder. ({type(error).__name__}: {error})"
         )
-        return _build_local_text_encoder_conf(text_encoder_fp32)
+        return _build_local_text_encoder_conf()
 
 
 def load_model(
     modelname=None,
     device=None,
+    text_encoder=None,
     eval_mode: bool = True,
     default_family: Optional[str] = "Kimodo",
     return_resolved_name: bool = False,
-    text_encoder=None,
-    text_encoder_fp32: bool = False,
 ):
     """Load a kimodo model by name (e.g. 'g1', 'soma').
 
@@ -125,15 +127,14 @@ def load_model(
             a full name (e.g. Kimodo-SOMA-RP-v1), or a partial name; unknown names
             are resolved via resolve_model_name using default_family.
         device: Target device for the model (e.g. 'cuda', 'cpu').
+        text_encoder: Optional prebuilt text encoder object to reuse instead of
+            constructing one from TEXT_ENCODER_MODE.
         eval_mode: If True, set model to eval mode.
         default_family: Used when modelname is not in AVAILABLE_MODELS to resolve
             partial names ("Kimodo" for demo/generation, "TMR" for embed script).
             Default "Kimodo".
         return_resolved_name: If True, return (model, resolved_short_key). If False,
             return only the model.
-        text_encoder: Pre-built text encoder to reuse. When provided, skips
-            text encoder selection/instantiation entirely.
-        text_encoder_fp32: If True, uses fp32 for the text encoder rather than default bfloat16.
 
     Returns:
         Loaded model in eval mode, or (model, resolved short key) if
@@ -184,30 +185,19 @@ def load_model(
         # Same process at the moment for TMR and Kimodo
         pass
 
-    if text_encoder is not None:
-        runtime_conf = OmegaConf.create({"checkpoint_dir": str(model_path)})
-    else:
-        text_encoder_url = get_env_var("TEXT_ENCODER_URL", DEFAULT_TEXT_ENCODER_URL)
-        runtime_conf = OmegaConf.create(
-            {
-                "checkpoint_dir": str(model_path),
-                "text_encoder": _select_text_encoder_conf(text_encoder_url, text_encoder_fp32),
-            }
-        )
-
+    text_encoder_url = get_env_var("TEXT_ENCODER_URL", DEFAULT_TEXT_ENCODER_URL)
+    runtime = {"checkpoint_dir": str(model_path)}
+    if text_encoder is None:
+        runtime["text_encoder"] = _select_text_encoder_conf(text_encoder_url)
+    runtime_conf = OmegaConf.create(runtime)
     model_cfg = OmegaConf.to_container(OmegaConf.merge(model_conf, runtime_conf), resolve=True)
+    if text_encoder is not None:
+        model_cfg["text_encoder"] = None
     model_cfg.pop("checkpoint_dir", None)
 
-    if text_encoder is not None:
-        # Prevent Hydra from instantiating a new text encoder; pass None so
-        # Kimodo.__init__ receives a placeholder we replace immediately after.
-        model_cfg["text_encoder"] = None
-
     model = instantiate_from_dict(model_cfg, overrides={"device": device})
-
     if text_encoder is not None:
         model.text_encoder = text_encoder
-
     if eval_mode:
         model = model.eval()
     if return_resolved_name:

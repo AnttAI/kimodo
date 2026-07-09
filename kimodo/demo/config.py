@@ -30,10 +30,10 @@ MAX_SESSION_MINUTES = float(os.environ.get("MAX_SESSION_MINUTES", "5.0"))
 
 DEFAULT_PLAYBACK_SPEED = 1.0
 # default start duration is 6.0 sec, but model can handle up to 10 sec
-DEFAULT_CUR_DURATION = 6.0
-DEFAULT_PROMPT = "A person walks forward."
-MIN_DURATION = 2.0
-MAX_DURATION = 10.0
+DEFAULT_CUR_DURATION = 4.0
+DEFAULT_PROMPT = "" if os.environ.get("TEXT_ENCODER_MODE", "").lower() == "dummy" else "A person walks forward."
+MIN_DURATION = 0.3
+MAX_DURATION = 15.0
 
 SHOW_TRANSITION_PARAMS = True
 INIT_POSTPROCESSING = True
@@ -41,13 +41,13 @@ NB_TRANSITION_FRAMES = 5
 
 LIGHT_THEME = dict(
     floor=(220, 220, 220),
-    grid=(180, 180, 180),
+    grid=(70, 70, 70),
 )
 
 # Dark theme: slightly lighter grid and floor for better visibility and less flat black
 DARK_THEME = dict(
     floor=(48, 48, 52),
-    grid=(105, 105, 110),
+    grid=(185, 185, 190),
 )
 
 EXAMPLES_ROOT_DIR = str(DEMO_EXAMPLES_ROOT)

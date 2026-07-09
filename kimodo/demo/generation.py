@@ -21,6 +21,11 @@ from .embedding_cache import CachedTextEncoder
 from .state import ClientSession, ModelBundle
 
 
+def _is_dummy_text_encoder(encoder) -> bool:
+    wrapped_encoder = getattr(encoder, "encoder", encoder)
+    return type(wrapped_encoder).__name__ == "DummyTextEncoder"
+
+
 def compute_model_constraints_lst(
     session: ClientSession,
     model_bundle: ModelBundle,
@@ -38,11 +43,26 @@ def compute_model_constraints_lst(
     skel_slice = model_skeleton.get_skel_slice(session.skeleton) if use_skel_slice else None
 
     dense_smooth_root_pos_2d = None
+    world_offset_2d = None
+    world_offset_3d = None
+    if session.generation_world_offset is not None:
+        world_offset_3d = torch.tensor(
+            session.generation_world_offset,
+            dtype=torch.float32,
+            device=device,
+        )
+        world_offset_2d = torch.tensor(
+            [session.generation_world_offset[0], session.generation_world_offset[2]],
+            dtype=torch.float32,
+            device=device,
+        )
     if session.constraints["2D Root"].dense_path:
         # get the full 2d root
         dense_smooth_root_pos_2d = session.constraints["2D Root"].get_constraint_info(device=device)["root_pos"][
             :, [0, 2]
         ]
+        if world_offset_2d is not None:
+            dense_smooth_root_pos_2d = dense_smooth_root_pos_2d - world_offset_2d
 
     model_constraints = []
     for track_name, constraint in session.constraints.items():
@@ -59,17 +79,59 @@ def compute_model_constraints_lst(
         frame_indices = torch.tensor(valid_frame_idx)
         if track_name == "2D Root":
             smooth_root_pos_2d = constraint_info["root_pos"][valid_idx][:, [0, 2]].to(device)
+            if world_offset_2d is not None:
+                smooth_root_pos_2d = smooth_root_pos_2d - world_offset_2d
+            global_root_heading = None
+            if session.constrained_root_headings is not None:
+                heading_angles = torch.tensor(
+                    [session.constrained_root_headings[frame] for frame in valid_frame_idx],
+                    dtype=smooth_root_pos_2d.dtype,
+                    device=device,
+                )
+                global_root_heading = torch.stack(
+                    [torch.cos(heading_angles), torch.sin(heading_angles)],
+                    dim=-1,
+                )
+            elif session.constrained_root_heading_angle is not None:
+                target_heading = float(session.constrained_root_heading_angle)
+                initial_heading = float(session.first_heading_angle or 0.0)
+                turn_heading = float(session.constrained_root_initial_turn_angle or target_heading)
+                turn_end_frame = max(1, int(session.constrained_root_turn_end_frame or 1))
+                frame_values = torch.tensor(valid_frame_idx, dtype=smooth_root_pos_2d.dtype, device=device)
+                turn_progress = torch.clamp(frame_values / turn_end_frame, min=0.0, max=1.0)
+                turn_delta = (turn_heading - initial_heading + np.pi) % (2.0 * np.pi) - np.pi
+                turn_angles = initial_heading + turn_progress * turn_delta
+                steering_frames = max(1, turn_end_frame // 2)
+                steering_progress = torch.clamp(
+                    (frame_values - turn_end_frame) / steering_frames,
+                    min=0.0,
+                    max=1.0,
+                )
+                steering_delta = (target_heading - turn_heading + np.pi) % (2.0 * np.pi) - np.pi
+                walking_angles = turn_heading + steering_progress * steering_delta
+                heading_angles = torch.where(
+                    frame_values <= turn_end_frame,
+                    turn_angles,
+                    walking_angles,
+                )
+                global_root_heading = torch.stack(
+                    [torch.cos(heading_angles), torch.sin(heading_angles)],
+                    dim=-1,
+                )
             # same as "smooth_root_2d"
             model_constraints.append(
                 Root2DConstraintSet(
                     model_skeleton,
                     frame_indices,
                     smooth_root_pos_2d,
+                    global_root_heading=global_root_heading,
                 )
             )
         elif track_name == "Full-Body":
             constraint_joints_pos = constraint_info["joints_pos"][valid_idx].to(device)
             constraint_joints_rot = constraint_info["joints_rot"][valid_idx].to(device)
+            if world_offset_3d is not None:
+                constraint_joints_pos = constraint_joints_pos - world_offset_3d
             if skel_slice is not None:
                 constraint_joints_pos = constraint_joints_pos[:, skel_slice]
                 constraint_joints_rot = constraint_joints_rot[:, skel_slice]
@@ -90,6 +152,8 @@ def compute_model_constraints_lst(
         elif track_name == "End-Effectors":
             constraint_joints_pos = constraint_info["joints_pos"][valid_idx].to(device)
             constraint_joints_rot = constraint_info["joints_rot"][valid_idx].to(device)
+            if world_offset_3d is not None:
+                constraint_joints_pos = constraint_joints_pos - world_offset_3d
             if skel_slice is not None:
                 constraint_joints_pos = constraint_joints_pos[:, skel_slice]
                 constraint_joints_rot = constraint_joints_rot[:, skel_slice]
@@ -149,8 +213,16 @@ def generate(
     add_character_motion,
 ) -> None:
     client_id = client.client_id
+    encoder = getattr(model_bundle.model, "text_encoder", None)
+    using_dummy_text_encoder = _is_dummy_text_encoder(encoder)
+    model_prompts = [""] * len(prompts) if using_dummy_text_encoder else prompts
     print(
-        f"Generating {num_samples} samples for a total of {sum(num_frames)} frames with those prompt: {prompts} (client {client_id})"
+        (
+            f"Generating {num_samples} samples for a total of {sum(num_frames)} frames "
+            f"with dummy text encoder; prompts omitted (client {client_id})"
+        )
+        if using_dummy_text_encoder
+        else f"Generating {num_samples} samples for a total of {sum(num_frames)} frames with those prompt: {prompts} (client {client_id})"
     )
 
     seed_everything(seed)
@@ -159,12 +231,14 @@ def generate(
     cfg_weight = cfg_weight or [2.0, 2.0]
     postprocess_parameters = postprocess_parameters or {}
     transitions_parameters = transitions_parameters or {}
+    model_parameters = postprocess_parameters | transitions_parameters
+    if session.first_heading_angle is not None:
+        model_parameters["first_heading_angle"] = float(session.first_heading_angle)
 
-    encoder = getattr(model_bundle.model, "text_encoder", None)
     if isinstance(encoder, CachedTextEncoder):
         with encoder.session_context(session):
             pred_joints_output = model_bundle.model(
-                prompts,
+                model_prompts,
                 num_frames,
                 diffusion_steps,
                 multi_prompt=True,
@@ -172,11 +246,11 @@ def generate(
                 cfg_weight=cfg_weight,
                 num_samples=num_samples,
                 cfg_type=cfg_type,
-                **(postprocess_parameters | transitions_parameters),
+                **model_parameters,
             )  # [B, T, motion_rep_dim]
     else:
         pred_joints_output = model_bundle.model(
-            prompts,
+            model_prompts,
             num_frames,
             diffusion_steps,
             multi_prompt=True,
@@ -184,12 +258,19 @@ def generate(
             cfg_weight=cfg_weight,
             num_samples=num_samples,
             cfg_type=cfg_type,
-            **(postprocess_parameters | transitions_parameters),
+            **model_parameters,
         )  # [B, T, motion_rep_dim]
 
     joints_pos = pred_joints_output["posed_joints"]  # [B, T, J, 3]
     joints_rot = pred_joints_output["global_rot_mats"]
     foot_contacts = pred_joints_output.get("foot_contacts")
+    if session.generation_world_offset is not None:
+        world_offset = torch.tensor(
+            session.generation_world_offset,
+            dtype=joints_pos.dtype,
+            device=joints_pos.device,
+        )
+        joints_pos = joints_pos + world_offset[None, None, None, :]
 
     # Optionally project G1 to real robot DoF (1-DoF per joint, clamped) for display.
     if real_robot_rotations and isinstance(session.skeleton, G1Skeleton34):

@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Kimodo Fulfillment Planner</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <p class="eyebrow">KIMODO · TWO RACKS · FIVE SHELVES EACH</p>
+        <h1>Fulfillment planner</h1>
+      </div>
+      <div class="connection">
+        <span id="connection-dot" class="status-dot"></span>
+        <span id="connection-label">Checking Viser…</span>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section class="viewer-panel panel">
+        <div class="panel-heading">
+          <div>
+            <p class="eyebrow">LIVE SCENE</p>
+            <h2>Kimodo Viser</h2>
+          </div>
+          <a class="quiet-link" href="http://localhost:7860/?fixedDpr=1" target="_blank" rel="noreferrer">
+            Open full view ↗
+          </a>
+        </div>
+        <div class="viewer-frame">
+          <iframe
+            title="Kimodo robot viewer"
+            src="http://localhost:7860/?fixedDpr=1"
+            allow="fullscreen"
+          ></iframe>
+          <div id="viewer-offline" class="viewer-message hidden">
+            Start the Kimodo robot app on port 7860, then refresh this page.
+          </div>
+        </div>
+        <div class="viewer-caption">
+          <span>Rack 1 · Coconut · Tomato · Water · Potato · Curry leaves</span>
+          <span>Rack 2 · Rice · Red gram · Coke · Ice cream · Chips</span>
+          <span>Counter · Delivery</span>
+        </div>
+      </section>
+
+      <aside class="control-column">
+        <section class="panel order-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">ORDER</p>
+              <h2>What should Kimodo fetch?</h2>
+            </div>
+            <span class="preview-badge">OR-Tools</span>
+          </div>
+
+          <label class="request-label" for="request-input">Natural-language request</label>
+          <div class="request-row">
+            <input id="request-input" value="2 potatoes, 2 tomatoes and 1 ice cream" autocomplete="off" />
+            <button id="plan-button" class="primary-button">Plan</button>
+          </div>
+          <div class="examples">
+            <button data-request="Give me 2 potatoes and 2 tomatoes">Safe packing</button>
+            <button data-request="I need 1 rice packet, 2 coke and 1 chips packet">Rack 2 order</button>
+            <button data-request="Give me 1 coconut, 2 tomatoes, 1 ice cream and 2 chips packets">Mixed order</button>
+          </div>
+
+          <div id="inventory-grid" class="inventory-grid" aria-label="Ten-shelf inventory"></div>
+          <p id="order-message" class="message" role="status"></p>
+        </section>
+
+        <section class="panel plan-panel">
+          <div class="panel-heading compact">
+            <div>
+              <p class="eyebrow">OR-TOOLS PACKING + MOTION PLAN</p>
+              <h2>Motion sequence</h2>
+            </div>
+            <div class="plan-metric"><b id="plan-duration">—</b><span>base travel</span></div>
+          </div>
+          <ol id="plan-list" class="plan-list">
+            <li class="empty-plan">Enter an order to build a route.</li>
+          </ol>
+          <div class="execution-controls">
+            <button id="run-button" class="primary-button" disabled>Run Viser preview</button>
+            <button id="stop-button" class="secondary-button" disabled>Stop</button>
+          </div>
+          <div class="hardware-safety">
+            <label>
+              <input id="hardware-confirm" type="checkbox" disabled />
+              <span>I confirm the robot is powered, subscribers are ready, and the work area is clear.</span>
+            </label>
+            <button id="hardware-button" class="hardware-button" disabled>Run approved plan on T3 hardware</button>
+            <button id="emergency-stop-button" class="emergency-stop-button">EMERGENCY STOP — REAL ROBOT</button>
+          </div>
+          <div class="progress-track"><span id="progress-bar"></span></div>
+          <p id="execution-message" class="message">Complete a Viser preview before hardware execution can be armed.</p>
+        </section>
+      </aside>
+    </main>
+
+    <script src="app.js"></script>
+  </body>
+</html>

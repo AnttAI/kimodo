@@ -58,3 +58,16 @@ class ClientSession:
     edit_mode_snapshot: Optional[dict[int, dict[str, object]]] = None
     undo_drag_snapshot: Optional[dict[str, object]] = None
     show_only_current_constraint: bool = False  # False = Show All, True = Show only Current
+    hide_constraint_overlays: bool = False
+    first_heading_angle: Optional[float] = None
+    constrained_root_heading_angle: Optional[float] = None
+    constrained_root_initial_turn_angle: Optional[float] = None
+    constrained_root_turn_end_frame: Optional[int] = None
+    constrained_root_headings: Optional[list[float]] = None
+    generation_world_offset: Optional[tuple[float, float, float]] = None
+    human_route_rack: Optional[str] = None
+    human_route_kind: Optional[str] = None
+    # Clean final standing pose from the latest successful "move to rack N"
+    # motion. Shelf-pick prompts reuse this pose so repeated same-rack picks do
+    # not start from the previous pick/hold pose.
+    human_outbound_rack_poses: dict[str, tuple[object, object]] = field(default_factory=dict)

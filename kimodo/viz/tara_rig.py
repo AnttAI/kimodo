@@ -75,6 +75,25 @@ _TARA_CSV_JOINT_NAME_MAP = {
     "right_ankle_pitch_joint_dof": "right_ankle_pitch_joint",
 }
 
+# Optional non-joint columns appended by the combined T3 export.  These drive
+# the wheel-base viewer/hardware and must not be interpreted as joint angles.
+_TARA_CSV_METADATA_COLUMNS = {
+    "time_s",
+    "root_x_m",
+    "root_y_m",
+    "root_z_m",
+    "root_yaw_rad",
+    "root_yaw_deg",
+    "step_ground_distance_m",
+    "distance_from_start_m",
+    "forward_velocity_m_s",
+    "yaw_rate_rad_s",
+    "left_wheel_rad_s",
+    "right_wheel_rad_s",
+    "left_motor_rpm",
+    "right_motor_rpm",
+}
+
 _TARA_CSV_TO_URDF_JOINT_NAME_MAP = {
     "waist_yaw_joint": "waist_yaw_joint",
     "waist_roll_joint": "waist_roll_joint",
@@ -172,7 +191,11 @@ def load_tara_motion_csv(path: str | Path, x_offset: float = 0.0) -> TaraMotionD
     if header[: len(expected_prefix)] != expected_prefix:
         raise ValueError(f"{path}: unsupported Tara CSV header.")
 
-    unknown_columns = [name for name in header[7:] if name not in _TARA_CSV_JOINT_NAME_MAP]
+    unknown_columns = [
+        name
+        for name in header[7:]
+        if name not in _TARA_CSV_JOINT_NAME_MAP and name not in _TARA_CSV_METADATA_COLUMNS
+    ]
     if unknown_columns:
         raise ValueError(f"{path}: unsupported Tara CSV joints: {unknown_columns}")
 
@@ -194,6 +217,7 @@ def load_tara_motion_csv(path: str | Path, x_offset: float = 0.0) -> TaraMotionD
     joint_angles = {
         _TARA_CSV_JOINT_NAME_MAP[column_name]: np.deg2rad(csv_data[:, column_idx]).astype(np.float64)
         for column_idx, column_name in enumerate(header[7:], start=7)
+        if column_name in _TARA_CSV_JOINT_NAME_MAP
     }
     return TaraMotionData(root_positions=root_positions, root_rotations=root_rotations, joint_angles=joint_angles)
 

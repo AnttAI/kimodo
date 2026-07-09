@@ -29,6 +29,9 @@ EXTRA_ARGS=()
 if [[ "${KIMODO_ROBOT_DRY_RUN:-0}" == "1" ]]; then
   EXTRA_ARGS+=(--dry-run)
 fi
+if [[ "${KIMODO_ROBOT_REQUIRE_BASE:-1}" == "1" ]]; then
+  EXTRA_ARGS+=(--require-base-subscriber)
+fi
 "$ROS_PYTHON_BIN" "$REPO_ROOT/kimodo/scripts/t2_robot_stream_publisher.py" \
   "${EXTRA_ARGS[@]}" \
   --wait-for-subscribers "$SUBSCRIBER_WAIT" \
