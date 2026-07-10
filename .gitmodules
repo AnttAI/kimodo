@@ -1,0 +1,3 @@
+[submodule "tara_sdk"]
+	path = tara_sdk
+	url = https://github.com/AnttAI/tara_sdk.git
