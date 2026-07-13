@@ -44,7 +44,7 @@ def _load_motion_npz(path: Path, device: str) -> tuple[torch.Tensor, torch.Tenso
     if joints_pos.ndim != 3 or joints_rot.ndim != 4:
         raise ValueError(f"{path}: unexpected tensor shapes for motion data")
 
-    skeleton = build_skeleton(joints_pos.shape[1])
+    skeleton = build_skeleton(joints_pos.shape[1]).to(device)
     return joints_pos, joints_rot, foot_contacts, skeleton
 
 

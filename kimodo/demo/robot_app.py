@@ -1236,8 +1236,9 @@ class RobotDemo(Demo):
         tara_max_rpm: float = 30.0,
         tara_rpm_scale: float = 1.0,
         tara_debug: bool = False,
+        model_server_url: str | None = None,
     ):
-        super().__init__(default_model_name=default_model_name)
+        super().__init__(default_model_name=default_model_name, model_server_url=model_server_url)
         self.robot_workflows: dict[int, RobotWorkflowState] = {}
         self.world_scene_path = world_scene_path.expanduser().resolve() if world_scene_path is not None else None
         self.tara_remote_url = tara_remote_url.rstrip("/") if tara_remote_url else None
@@ -5783,6 +5784,11 @@ def main() -> None:
         help=f"Text encoder server URL. Defaults to TEXT_ENCODER_URL or {DEFAULT_TEXT_ENCODER_URL}.",
     )
     parser.add_argument(
+        "--model-server-url",
+        default=os.environ.get("KIMODO_MODEL_SERVER_URL"),
+        help="Optional FastAPI Kimodo model server URL. If set, the Viser UI sends generation requests remotely.",
+    )
+    parser.add_argument(
         "--world-scene-path",
         default=os.environ.get("KIMODO_WORLD_SCENE_PATH", str(DEFAULT_WORLD_SCENE_PATH)),
         help="Optional world PLY to load into the Viser scene without changing the human or robot meshes.",
@@ -5834,6 +5840,7 @@ def main() -> None:
             tara_max_rpm=args.tara_max_rpm,
             tara_rpm_scale=args.tara_rpm_scale,
             tara_debug=args.tara_debug,
+            model_server_url=args.model_server_url,
         )
     except Exception:
         raise SystemExit(_text_encoder_startup_error(text_encoder_mode)) from None

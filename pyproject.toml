@@ -31,6 +31,8 @@ dependencies = [
   "av>=16.1.0",
   "bvhio",
   "websockets>=13",
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
 ]
 
 [project.optional-dependencies]

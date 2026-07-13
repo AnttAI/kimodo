@@ -2,11 +2,15 @@
 # SPDX-License-Identifier: Apache-2.0
 
 import base64
+import json
 import os
 import shutil
+import tempfile
 import threading
 import time
+from types import SimpleNamespace
 from typing import Optional
+import urllib.request
 
 import numpy as np
 import torch
@@ -15,7 +19,9 @@ import viser
 from kimodo.assets import DEMO_ASSETS_ROOT
 from kimodo.model.load_model import load_model
 from kimodo.model.registry import resolve_model_name
+from kimodo.motion_io import load_motion_file
 from kimodo.skeleton import SkeletonBase, SOMASkeleton30
+from kimodo.skeleton.registry import build_skeleton
 from kimodo.tools import load_json
 from kimodo.viz import viser_utils
 from kimodo.viz.viser_utils import (
@@ -44,6 +50,7 @@ from .config import (
     MIN_DURATION,
     MODEL_EXAMPLES_DIRS,
     MODEL_NAMES,
+    NB_TRANSITION_FRAMES,
     SERVER_NAME,
     SERVER_PORT,
 )
@@ -53,9 +60,10 @@ from .state import ClientSession, ModelBundle
 
 
 class Demo:
-    def __init__(self, default_model_name: str = DEFAULT_MODEL):
+    def __init__(self, default_model_name: str = DEFAULT_MODEL, model_server_url: str | None = None):
         self.device = "cuda:0" if torch.cuda.is_available() else "cpu"
         print(f"Using device: {self.device}")
+        self.model_server_url = model_server_url.rstrip("/") if model_server_url else None
         self.models: dict[str, ModelBundle] = {}
         self._text_encoder = None
         resolved = resolve_model_name(default_model_name, "Kimodo")
@@ -128,6 +136,12 @@ class Demo:
         if model_name in self.models:
             return self.models[model_name]
 
+        if self.model_server_url is not None:
+            bundle = self._build_lightweight_model_bundle(model_name)
+            self.models[model_name] = bundle
+            print(f"Using lightweight viewer bundle for {model_name}; generation is remote")
+            return bundle
+
         print(f"Loading model {model_name}...")
         try:
             model = load_model(
@@ -157,6 +171,92 @@ class Demo:
         print(f"Model {model_name} loaded successfully")
         self.prewarm_embedding_cache(model_name, bundle.model)
         return bundle
+
+    def _build_lightweight_model_bundle(self, model_name: str) -> ModelBundle:
+        resolved = resolve_model_name(model_name, "Kimodo")
+        lowered = resolved.lower()
+        if "soma" in lowered:
+            model_skeleton = build_skeleton(30).to(self.device)
+            display_skeleton = build_skeleton(77).to(self.device)
+        elif "g1" in lowered:
+            model_skeleton = build_skeleton(34).to(self.device)
+            display_skeleton = model_skeleton
+        elif "smplx" in lowered:
+            model_skeleton = build_skeleton(22).to(self.device)
+            display_skeleton = model_skeleton
+        else:
+            raise ValueError(f"Cannot infer lightweight skeleton for model '{model_name}'")
+
+        return ModelBundle(
+            model=SimpleNamespace(skeleton=model_skeleton),
+            motion_rep=None,
+            skeleton=display_skeleton,
+            model_fps=30.0,
+        )
+
+    @staticmethod
+    def _jsonable_tensor_tree(obj):
+        if hasattr(obj, "detach"):
+            return obj.detach().cpu().tolist()
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        if isinstance(obj, dict):
+            return {key: Demo._jsonable_tensor_tree(value) for key, value in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [Demo._jsonable_tensor_tree(value) for value in obj]
+        return obj
+
+    def _post_remote_generation(self, payload: dict) -> dict:
+        if self.model_server_url is None:
+            raise RuntimeError("Remote model server URL is not configured.")
+        data = json.dumps(payload).encode("utf-8")
+        request = urllib.request.Request(
+            f"{self.model_server_url}/generate",
+            data=data,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=None) as response:
+            return json.loads(response.read().decode("utf-8"))
+
+    def _add_remote_generated_motions(self, client: viser.ClientHandle, response: dict) -> None:
+        client_id = client.client_id
+        session = self.client_sessions[client_id]
+        motions = response.get("motions") or []
+        if not motions:
+            raise RuntimeError("Model server returned no motions.")
+
+        self.clear_motions(client_id)
+        center_idx = len(motions) // 2
+        for idx, motion_info in enumerate(motions):
+            encoded = motion_info.get("npz_base64")
+            if not encoded:
+                raise RuntimeError("Model server response did not include npz_base64 data.")
+            with tempfile.NamedTemporaryFile(prefix="kimodo_remote_", suffix=".npz", delete=False) as tmp:
+                tmp.write(base64.b64decode(encoded))
+                tmp_path = tmp.name
+            try:
+                joints_pos, joints_rot, foot_contacts, skeleton = load_motion_file(tmp_path, self.device)
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+            skeleton = skeleton.to(self.device) if hasattr(skeleton, "to") else skeleton
+            joints_pos = joints_pos.to(self.device)
+            joints_rot = joints_rot.to(self.device)
+            if foot_contacts is not None:
+                foot_contacts = foot_contacts.to(self.device)
+            joints_pos[..., 0] += (idx - center_idx) * 1.0
+            self.add_character_motion(client, skeleton, joints_pos, joints_rot, foot_contacts)
+
+        if session.motions:
+            first_motion = next(iter(session.motions.values()))
+            session.max_frame_idx = first_motion.length - 1
+            session.cur_duration = first_motion.length / float(session.model_fps or response.get("fps") or 30.0)
+            client.timeline.set_current_frame(0)
+            client.timeline.set_zoom_settings(max_frames_zoom=max(session.max_frame_idx + 1, 1000))
+            self.set_frame(client_id, 0)
 
     def prewarm_embedding_cache(self, model_name: str, model: object) -> None:
         encoder = getattr(model, "text_encoder", None)
@@ -569,6 +669,39 @@ class Demo:
         try:
             session = self.client_sessions[client.client_id]
             model_bundle = self.load_model(session.model_name)
+            if self.model_server_url is not None:
+                model_constraints = generation.compute_model_constraints_lst(
+                    session,
+                    model_bundle,
+                    sum(num_frames),
+                    self.device,
+                )
+                constraints = [
+                    self._jsonable_tensor_tree(constraint.get_save_info())
+                    for constraint in model_constraints
+                ]
+                model_parameters = (postprocess_parameters or {}) | (transitions_parameters or {})
+                response = self._post_remote_generation(
+                    {
+                        "model": session.model_name,
+                        "prompts": prompts,
+                        "num_frames": num_frames,
+                        "num_samples": num_samples,
+                        "seed": seed,
+                        "diffusion_steps": diffusion_steps,
+                        "cfg_type": cfg_type,
+                        "cfg_weight": cfg_weight,
+                        "constraints": constraints,
+                        "post_processing": bool(model_parameters.get("post_processing", True)),
+                        "root_margin": float(model_parameters.get("root_margin", 0.04)),
+                        "num_transition_frames": int(
+                            model_parameters.get("num_transition_frames", NB_TRANSITION_FRAMES)
+                        ),
+                        "return_npz_base64": True,
+                    }
+                )
+                self._add_remote_generated_motions(client, response)
+                return
             generation.generate(
                 client=client,
                 session=session,
