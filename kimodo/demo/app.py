@@ -17,7 +17,6 @@ import torch
 
 import viser
 from kimodo.assets import DEMO_ASSETS_ROOT
-from kimodo.model.load_model import load_model
 from kimodo.model.registry import resolve_model_name
 from kimodo.motion_io import load_motion_file
 from kimodo.skeleton import SkeletonBase, SOMASkeleton30
@@ -144,6 +143,8 @@ class Demo:
 
         print(f"Loading model {model_name}...")
         try:
+            from kimodo.model.load_model import load_model
+
             model = load_model(
                 modelname=model_name,
                 device=self.device,

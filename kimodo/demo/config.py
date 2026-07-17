@@ -30,7 +30,7 @@ MAX_SESSION_MINUTES = float(os.environ.get("MAX_SESSION_MINUTES", "5.0"))
 
 DEFAULT_PLAYBACK_SPEED = 1.0
 # default start duration is 6.0 sec, but model can handle up to 10 sec
-DEFAULT_CUR_DURATION = 4.0
+DEFAULT_CUR_DURATION = 7.0
 DEFAULT_PROMPT = "" if os.environ.get("TEXT_ENCODER_MODE", "").lower() == "dummy" else "A person walks forward."
 MIN_DURATION = 0.3
 MAX_DURATION = 15.0

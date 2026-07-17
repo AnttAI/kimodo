@@ -33,6 +33,67 @@ class RackPickRequest:
     shelf_number: int = 4
 
 
+def cardinal_rack_route_required_seconds(
+    *,
+    approach_position: Sequence[float],
+    final_heading: float,
+    fps: float,
+    initial_heading: float = 0.0,
+    turn_seconds_per_90: float = 0.75,
+    walk_speed_m_s: float = 0.90,
+    first_axis: str | None = None,
+) -> float:
+    """Return the minimum duration needed by ``plan_cardinal_rack_route``."""
+    if fps <= 0.0 or walk_speed_m_s <= 0.0:
+        raise ValueError("fps and walk_speed_m_s must be positive")
+
+    target = tuple(float(value) for value in approach_position)
+    start = (0.0, 0.0, 0.0)
+    if first_axis not in (None, "x", "z"):
+        raise ValueError("first_axis must be 'x', 'z', or None")
+
+    points = [start]
+    use_z_first = first_axis == "z" or (first_axis is None and abs(math.sin(final_heading)) < 0.5)
+    if use_z_first:
+        _append_unique_point(points, (0.0, 0.0, target[2]))
+    else:
+        _append_unique_point(points, (target[0], 0.0, 0.0))
+    _append_unique_point(points, target)
+
+    actions: list[tuple[str, object]] = []
+    current_heading = initial_heading
+    for start_point, end_point in zip(points, points[1:]):
+        movement_heading = forward_route_heading(start_point, end_point)
+        turn_delta = _normalize_angle(movement_heading - current_heading)
+        if not math.isclose(turn_delta, 0.0, abs_tol=1e-8):
+            degrees = int(round(abs(math.degrees(turn_delta))))
+            if degrees not in (90, 180):
+                raise ValueError(f"Cardinal route produced a non-cardinal turn: {degrees} degrees")
+            actions.append(("turn", turn_delta))
+        actions.append(("move", (start_point, end_point)))
+        current_heading = movement_heading
+
+    final_turn = _normalize_angle(final_heading - current_heading)
+    if not math.isclose(final_turn, 0.0, abs_tol=1e-8):
+        degrees = int(round(abs(math.degrees(final_turn))))
+        if degrees not in (90, 180):
+            raise ValueError(f"Final rack-facing turn is not cardinal: {degrees} degrees")
+        actions.append(("turn", final_turn))
+
+    turn_steps = [
+        max(1, int(round(turn_seconds_per_90 * fps * abs(float(value)) / (math.pi / 2.0))))
+        for kind, value in actions
+        if kind == "turn"
+    ]
+    move_distances = [
+        math.hypot(value[1][0] - value[0][0], value[1][2] - value[0][2])
+        for kind, value in actions
+        if kind == "move"
+    ]
+    move_steps = [max(1, int(round(distance / walk_speed_m_s * fps))) for distance in move_distances]
+    return (sum(turn_steps) + sum(move_steps) + 1) / fps
+
+
 def requested_rack_name(prompts: Sequence[str]) -> str | None:
     """Return a normalized rack name when one rack is named in one prompt."""
     if len(prompts) != 1:
@@ -65,7 +126,7 @@ def requested_human_return_rack_name(prompts: Sequence[str]) -> str | None:
     if len(prompts) != 1:
         return None
     normalized = " ".join(prompts[0].strip().lower().replace("_", " ").split())
-    if "base" in normalized or "origin" not in normalized:
+    if "base" in normalized or not ("origin" in normalized or "counter" in normalized):
         return None
     if not (normalized.startswith("return ") or " from rack" in normalized):
         return None
@@ -73,7 +134,7 @@ def requested_human_return_rack_name(prompts: Sequence[str]) -> str | None:
 
 
 def requested_rack_pick(prompts: Sequence[str]) -> RackPickRequest | None:
-    """Parse ``pick object 1/2/3 from rack N shelf 4`` prompts."""
+    """Parse ``pick object 1/2/3 from rack N shelf 1..5`` prompts."""
     if len(prompts) != 1:
         return None
     prompt = prompts[0]
@@ -88,8 +149,8 @@ def requested_rack_pick(prompts: Sequence[str]) -> RackPickRequest | None:
     shelf_number = int(shelf_match.group(1))
     if object_index not in {1, 2, 3}:
         raise ValueError("Rack object number must be 1, 2, or 3")
-    if shelf_number != 4:
-        raise ValueError("Automatic rack picking currently supports shelf 4 only")
+    if shelf_number not in {1, 2, 3, 4, 5}:
+        raise ValueError("Rack shelf number must be 1, 2, 3, 4, or 5")
     return RackPickRequest(rack_name, object_index, shelf_number)
 
 
@@ -338,7 +399,15 @@ def plan_cardinal_rack_route(
     move_steps = [max(1, int(round(distance / walk_speed_m_s * fps))) for distance in move_distances]
     required_steps = sum(turn_steps) + sum(move_steps)
     if required_steps > available_steps:
-        required_seconds = (required_steps + 1) / fps
+        required_seconds = cardinal_rack_route_required_seconds(
+            approach_position=approach_position,
+            final_heading=final_heading,
+            fps=fps,
+            initial_heading=initial_heading,
+            turn_seconds_per_90=turn_seconds_per_90,
+            walk_speed_m_s=walk_speed_m_s,
+            first_axis=first_axis,
+        )
         raise ValueError(
             f"Motion duration is too short for a steady normal walk; use at least {math.ceil(required_seconds)} seconds"
         )
@@ -427,15 +496,33 @@ def plan_cardinal_return_route(
     total_frames: int,
     fps: float,
     reverse_distance: float = 0.10,
+    reverse_seconds: float = 0.50,
     turn_seconds_per_90: float = 0.75,
     walk_speed_m_s: float = 0.90,
+    initial_hold_seconds: float = 0.0,
+    final_hold_seconds: float = 0.0,
+    first_axis: str = "x",
+    target_position: Sequence[float] | None = None,
 ) -> CardinalRoute:
     """Plan reverse-clearance, two 90° turns, and a cardinal return to origin."""
     if turn_side not in {"left", "right"}:
         raise ValueError("turn_side must be left or right")
-    if total_frames < 2 or fps <= 0.0 or reverse_distance < 0.0 or walk_speed_m_s <= 0.0:
+    if first_axis not in {"x", "z"}:
+        raise ValueError("first_axis must be x or z")
+    if (
+        total_frames < 2
+        or fps <= 0.0
+        or reverse_distance < 0.0
+        or (reverse_distance > 0.0 and reverse_seconds <= 0.0)
+        or walk_speed_m_s <= 0.0
+        or initial_hold_seconds < 0.0
+        or final_hold_seconds < 0.0
+    ):
         raise ValueError("Invalid return-route duration or reverse distance")
     start = tuple(float(value) for value in start_position)
+    target = tuple(float(value) for value in (target_position or (0.0, 0.0, 0.0)))
+    if len(target) != 3:
+        raise ValueError("target_position must contain X, Y, and Z")
     forward_x, forward_z = math.sin(start_heading), math.cos(start_heading)
     backed = (
         start[0] - reverse_distance * forward_x,
@@ -451,21 +538,21 @@ def plan_cardinal_return_route(
     actions.extend([("turn", turn_sign * math.pi / 2.0), ("turn", turn_sign * math.pi / 2.0)])
     current = backed
     current_heading = opposite_heading
-    if not math.isclose(current[0], 0.0, abs_tol=1e-9):
-        next_point = (0.0, 0.0, current[2])
+    for axis in ((0, 2) if first_axis == "x" else (2, 0)):
+        if axis == 0:
+            if math.isclose(current[0], target[0], abs_tol=1e-9):
+                continue
+            next_point = (target[0], current[1], current[2])
+        else:
+            if math.isclose(current[2], target[2], abs_tol=1e-9):
+                continue
+            next_point = (current[0], current[1], target[2])
         desired = forward_route_heading(current, next_point)
         delta = _normalize_angle(desired - current_heading)
         if not math.isclose(delta, 0.0, abs_tol=1e-9):
             actions.append(("turn", delta))
         actions.append(("forward", (current, next_point)))
         current, current_heading = next_point, desired
-    if not math.isclose(current[2], 0.0, abs_tol=1e-9):
-        next_point = (0.0, 0.0, 0.0)
-        desired = forward_route_heading(current, next_point)
-        delta = _normalize_angle(desired - current_heading)
-        if not math.isclose(delta, 0.0, abs_tol=1e-9):
-            actions.append(("turn", delta))
-        actions.append(("forward", (current, next_point)))
 
     available_steps = total_frames - 1
     turn_values = [float(value) for kind, value in actions if kind == "turn"]
@@ -473,14 +560,16 @@ def plan_cardinal_return_route(
         max(1, int(round(turn_seconds_per_90 * fps * abs(value) / (math.pi / 2.0))))
         for value in turn_values
     ]
-    reverse_steps = max(1, int(round(0.50 * fps))) if reverse_distance > 0.0 else 0
+    initial_hold_steps = int(round(initial_hold_seconds * fps))
+    final_hold_steps = int(round(final_hold_seconds * fps))
+    reverse_steps = max(1, int(round(reverse_seconds * fps))) if reverse_distance > 0.0 else 0
     move_values = [value for kind, value in actions if kind == "forward"]
     move_distances = [
         math.hypot(value[1][0] - value[0][0], value[1][2] - value[0][2])
         for value in move_values
     ]
     move_steps = [max(1, int(round(distance / walk_speed_m_s * fps))) for distance in move_distances]
-    required_steps = reverse_steps + sum(turn_steps) + sum(move_steps)
+    required_steps = initial_hold_steps + reverse_steps + sum(turn_steps) + sum(move_steps) + final_hold_steps
     if required_steps > available_steps:
         required_seconds = (required_steps + 1) / fps
         raise ValueError(
@@ -490,6 +579,9 @@ def plan_cardinal_return_route(
     positions = [start]
     headings = [start_heading]
     position, heading = start, start_heading
+    for _step in range(initial_hold_steps):
+        positions.append(position)
+        headings.append(heading)
     turn_index = move_index = 0
     for kind, value in actions:
         if kind == "backward":
@@ -531,7 +623,7 @@ def plan_cardinal_return_route(
     return CardinalRoute(
         positions=tuple(positions),
         headings=tuple(headings),
-        approach_position=(0.0, 0.0, 0.0),
+        approach_position=target,
         final_heading=_normalize_angle(headings[-1]),
         turn_degrees=tuple(int(round(abs(math.degrees(value)))) for value in turn_values),
     )
@@ -567,11 +659,11 @@ def rack_walk_model_prompt(prompt: str, rack_name: str) -> str:
 
 
 def rack_return_model_prompt(rack_name: str) -> str:
-    """Return a focused human locomotion prompt for rack-to-origin routes."""
+    """Return a focused human locomotion prompt for rack-to-counter/origin routes."""
     rack_label = rack_name.replace("_", " ")
     return (
         "An ordinary healthy person walks at a steady normal pace with a neutral natural gait. "
         "They stand upright, look forward, and use a relaxed symmetrical arm swing. They stop at "
         "each corner, make a controlled slow turn in place, resume the same steady walking pace, "
-        f"and finish standing naturally at the origin after leaving {rack_label}."
+        f"and finish standing naturally at the counter/origin after leaving {rack_label}."
     )

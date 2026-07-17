@@ -4,9 +4,12 @@
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import math
 import os
 from pathlib import Path
+import re
 import sys
 import time
 import urllib.error
@@ -45,6 +48,92 @@ def configured_controller_url() -> str:
 
 
 DEFAULT_CONTROLLER_URL = configured_controller_url()
+RACK_PROMPT_RE = re.compile(r"\brack[\s_-]*(\d+)\b", re.IGNORECASE)
+PICK_PROMPT_RE = re.compile(r"\bpick\s+object\s+\d+\s+from\s+rack[\s_-]*\d+\s+shelf\s+\d+\b", re.IGNORECASE)
+RACK_WIDTH_M = 0.34
+RACK_HUMAN_APPROACH_CLEARANCE_M = 0.45
+RACK_HUMAN_SLOW_WALK_SPEED_M_S = 0.60
+RACK_HUMAN_FAST_WALK_SPEED_M_S = 0.90
+WORK_AREA_GRID_SECTION_M = 0.60
+WORK_AREA_GRID_SHAPE = (4, 6)
+WORK_AREA_SIDE_SHIFT_M = 0.60
+RACK_MAP_POSITIONS = {
+    1: (-1.63, 0.0, -1.20),
+    2: (-1.63, 0.0, -2.40),
+    3: (-1.10, 0.0, -3.43),
+    4: (0.00, 0.0, -3.43),
+}
+RACK_MAP_YAWS_RAD = {
+    3: -math.pi / 2.0,
+    4: -math.pi / 2.0,
+}
+
+
+def repo_root() -> Path:
+    return plugin_root().parents[1]
+
+
+def _planner_module():
+    planner_path = repo_root() / "kimodo" / "demo" / "warehouse_ui" / "rack_motion_planner.py"
+    spec = importlib.util.spec_from_file_location("kimodo_rack_motion_planner", planner_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Could not load rack motion planner from {planner_path}")
+    planner = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = planner
+    spec.loader.exec_module(planner)
+    return (
+        planner.cardinal_rack_route_required_seconds,
+        planner.rack_width_side_approach_pose,
+    )
+
+
+def minimum_prompt_duration_seconds(prompt: str) -> float | None:
+    if PICK_PROMPT_RE.search(prompt):
+        return 7.0
+
+    rack_match = RACK_PROMPT_RE.search(prompt)
+    if rack_match is None:
+        return None
+    if not re.search(r"\b(move|walk|go|navigate)\b", prompt, re.IGNORECASE):
+        return None
+
+    rack_number = int(rack_match.group(1))
+    if rack_number not in RACK_MAP_POSITIONS:
+        return None
+
+    cardinal_rack_route_required_seconds, rack_width_side_approach_pose = _planner_module()
+    x_near = WORK_AREA_SIDE_SHIFT_M
+    x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
+    z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
+    rack_target, rack_facing_heading = rack_width_side_approach_pose(
+        RACK_MAP_POSITIONS[rack_number],
+        RACK_MAP_YAWS_RAD.get(rack_number, 0.0),
+        RACK_WIDTH_M,
+        RACK_HUMAN_APPROACH_CLEARANCE_M,
+        (x_far, x_near),
+        (z_far, 0.0),
+    )
+    required_seconds = cardinal_rack_route_required_seconds(
+        approach_position=rack_target,
+        final_heading=rack_facing_heading,
+        fps=30.0,
+        walk_speed_m_s=rack_human_walk_speed_m_s(rack_number),
+        first_axis="z" if rack_number in {1, 2, 3} else "x",
+    )
+    return required_seconds + 1.0
+
+
+def rack_human_walk_speed_m_s(rack_number: int) -> float:
+    if rack_number in {3, 4}:
+        return RACK_HUMAN_FAST_WALK_SPEED_M_S
+    return RACK_HUMAN_SLOW_WALK_SPEED_M_S
+
+
+def resolved_duration_seconds(prompt: str, requested_duration: float) -> float:
+    tool_duration = minimum_prompt_duration_seconds(prompt)
+    if tool_duration is None:
+        return requested_duration
+    return tool_duration
 
 
 def controller_json(
@@ -86,16 +175,28 @@ def job_endpoint(job_id: str) -> str:
 def print_job(job: dict[str, object]) -> None:
     print(f"job:{job.get('job_id')}")
     print(f"status:{job.get('status')}")
-    for key in ("stem", "bvh_path", "csv_path", "log_path", "error"):
+    for key in (
+        "stem",
+        "retarget_target",
+        "bvh_path",
+        "csv_path",
+        "t3_csv_path",
+        "wheel_csv_path",
+        "log_path",
+        "playback_started",
+        "playback_mode",
+        "error",
+    ):
         value = job.get(key)
         if value:
             print(f"{key}:{value}")
 
 
 def run(args: argparse.Namespace) -> int:
+    duration = resolved_duration_seconds(args.prompt, args.duration)
     payload: dict[str, object] = {
         "prompt": args.prompt,
-        "duration_seconds": args.duration,
+        "duration_seconds": duration,
         "seed": args.seed,
         "diffusion_steps": args.diffusion_steps,
     }
@@ -160,7 +261,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Generate, save, and retarget a motion prompt.")
     run_parser.add_argument("prompt", help="Text prompt to generate.")
-    run_parser.add_argument("--duration", type=float, default=6.0, help="Motion duration in seconds.")
+    run_parser.add_argument(
+        "--duration",
+        type=float,
+        default=6.0,
+        help="Motion duration in seconds. Rack/pick prompts automatically use the tool-computed duration.",
+    )
     run_parser.add_argument("--seed", type=int, default=42, help="Generation seed.")
     run_parser.add_argument("--diffusion-steps", type=int, default=100, help="Denoising steps.")
     run_parser.add_argument("--stem", help="Optional memory stem to save under.")

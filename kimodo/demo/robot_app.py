@@ -9,10 +9,13 @@ SOMA -> T2 -> real robot workflow panel.
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import errno
 import hashlib
 import http.server
 import json
+import math
 import mimetypes
 import os
 import re
@@ -20,6 +23,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -36,6 +40,7 @@ from plyfile import PlyData
 from kimodo.demo.app import Demo
 from kimodo.demo.config import DEFAULT_CUR_DURATION, DEFAULT_MODEL, NB_TRANSITION_FRAMES
 from kimodo.demo.warehouse_ui.rack_motion_planner import (
+    cardinal_rack_route_required_seconds,
     cardinal_route_primitives,
     choose_safer_turn_side,
     plan_cardinal_rack_route,
@@ -121,12 +126,11 @@ RACK_SHELF_SPACING_M = 0.3048  # one foot
 RACK_SHELF_THICKNESS_M = 0.018
 RACK_POST_SIZE_M = 0.025
 RACK_SHELF_COUNT = 5
-RACK_PICK_SHELF_NUMBER = 4
 RACK_PICK_OBJECT_SIZE_M = 0.06
 RACK_PICK_OBJECT_COLORS = ((220, 70, 70), (70, 180, 90), (70, 120, 220))
 RACK_SHELF_PRODUCTS = {
-    "rack_1": ("Coconuts", "Tomatoes", "Water", "Potatoes", "Curry leaves"),
-    "rack_2": ("Rice", "Red gram", "Coke", "Ice cream", "Chips packets"),
+    "rack_1": ("Coconuts", "Tomatoes", "Potatoes", "Water", "Curry leaves"),
+    "rack_2": ("Rice", "Red gram", "Ice cream", "Coke", "Chips packets"),
 }
 RACK_MAP_POSITIONS = {
     "rack_1": np.array([-1.63, 0.0, -1.20], dtype=np.float64),
@@ -143,10 +147,18 @@ RACK_MAP_YAWS_RAD = {
 # Stop in front of the shelf-opening (width) face, measured outward from the
 # rack edge rather than from its center.
 RACK_HUMAN_APPROACH_CLEARANCE_M = 0.45
+RACK_HUMAN_SLOW_WALK_SPEED_M_S = 0.60
+RACK_HUMAN_FAST_WALK_SPEED_M_S = 0.90
 WORK_AREA_GRID_SECTION_M = 0.60
 WORK_AREA_GRID_SHAPE = (4, 6)  # 4 x 6 bold sections = 24 squares.
 WORK_AREA_SIDE_SHIFT_M = 0.60  # Put the robot on the edge, one section from the corner.
 WORK_AREA_BOUNDARY_COLOR = (255, 128, 0)
+COUNTER_TABLE_LENGTH_M = 0.80
+COUNTER_TABLE_WIDTH_M = 0.40
+COUNTER_TABLE_HEIGHT_M = 1.03
+COUNTER_TABLE_DISTANCE_FROM_ORIGIN_M = 0.30
+COUNTER_TABLE_TOP_THICKNESS_M = 0.06
+COUNTER_TABLE_LEG_SIZE_M = 0.045
 WORLD_SCENE_PRESETS = {
     "scene.ply": {
         "scale": 0.75,
@@ -180,38 +192,38 @@ def _rack_shelf_surface_heights() -> tuple[float, ...]:
 def _add_pick_objects_to_scene(
     client: viser.ClientHandle,
 ) -> tuple[
-    dict[tuple[str, int], viser.SceneHandle],
-    dict[tuple[str, int], np.ndarray],
+    dict[tuple[str, int, int], viser.SceneHandle],
+    dict[tuple[str, int, int], np.ndarray],
 ]:
-    """Place three selectable objects on Shelf 4 of every physical rack."""
-    handles: dict[tuple[str, int], viser.SceneHandle] = {}
-    home_positions: dict[tuple[str, int], np.ndarray] = {}
-    shelf_height = _rack_shelf_surface_heights()[RACK_PICK_SHELF_NUMBER - 1]
+    """Place three selectable objects on every shelf of every physical rack."""
+    handles: dict[tuple[str, int, int], viser.SceneHandle] = {}
+    home_positions: dict[tuple[str, int, int], np.ndarray] = {}
     for rack_name, rack_center in RACK_MAP_POSITIONS.items():
         rack_yaw = RACK_MAP_YAWS_RAD.get(rack_name, 0.0)
-        for object_index in range(1, 4):
-            key = (rack_name, object_index)
-            position = np.asarray(
-                rack_shelf_object_position(
-                    rack_center,
-                    rack_yaw,
-                    shelf_height,
-                    object_index,
-                    face_normal_half_extent_m=RACK_WIDTH_M / 2.0,
-                    object_height_m=RACK_PICK_OBJECT_SIZE_M,
-                ),
-                dtype=np.float64,
-            )
-            handle = client.scene.add_box(
-                # Keep these outside the transformed rack frame: their stored
-                # positions are world coordinates and later become hand coordinates.
-                f"/physical_world/rack_pick_objects/{rack_name}/object_{object_index}",
-                dimensions=(RACK_PICK_OBJECT_SIZE_M,) * 3,
-                color=RACK_PICK_OBJECT_COLORS[object_index - 1],
-                position=position,
-            )
-            handles[key] = handle
-            home_positions[key] = position
+        for shelf_number, shelf_height in enumerate(_rack_shelf_surface_heights(), start=1):
+            for object_index in range(1, 4):
+                key = (rack_name, shelf_number, object_index)
+                position = np.asarray(
+                    rack_shelf_object_position(
+                        rack_center,
+                        rack_yaw,
+                        shelf_height,
+                        object_index,
+                        face_normal_half_extent_m=RACK_WIDTH_M / 2.0,
+                        object_height_m=RACK_PICK_OBJECT_SIZE_M,
+                    ),
+                    dtype=np.float64,
+                )
+                handle = client.scene.add_box(
+                    # Keep these outside the transformed rack frame: their stored
+                    # positions are world coordinates and later become hand coordinates.
+                    f"/physical_world/rack_pick_objects/{rack_name}/shelf_{shelf_number}/object_{object_index}",
+                    dimensions=(RACK_PICK_OBJECT_SIZE_M,) * 3,
+                    color=RACK_PICK_OBJECT_COLORS[object_index - 1],
+                    position=position,
+                )
+                handles[key] = handle
+                home_positions[key] = position
     return handles, home_positions
 
 
@@ -327,14 +339,19 @@ def _enforce_right_arm_reach(
     palm_normal_local: np.ndarray | None = None,
     elbow_bend_hint_world: np.ndarray | None = None,
     refresh_cache: bool = True,
+    side: str = "right",
 ) -> float:
     """Apply smooth analytic two-bone IK and return final wrist error in meters."""
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
     skeleton = motion.skeleton
     names = skeleton.bone_order_names
-    shoulder_idx = names.index("RightArm")
-    elbow_idx = names.index("RightForeArm")
-    wrist_idx = names.index("RightHand")
-    hand_indices = [names.index(name) for name in skeleton.right_hand_joint_names]
+    prefix = "Left" if side == "left" else "Right"
+    shoulder_idx = names.index(f"{prefix}Arm")
+    elbow_idx = names.index(f"{prefix}ForeArm")
+    wrist_idx = names.index(f"{prefix}Hand")
+    hand_names = skeleton.left_hand_joint_names if side == "left" else skeleton.right_hand_joint_names
+    hand_indices = [names.index(name) for name in hand_names]
 
     positions = motion.joints_pos.detach().cpu().numpy().copy()
     global_rotations = motion.joints_rot.detach().cpu().numpy().copy()
@@ -410,12 +427,13 @@ def _enforce_right_arm_reach(
                     global_rotations[frame, hand_idx] = roll_delta @ global_rotations[frame, hand_idx]
         if target_hand_rotations_world is not None:
             desired_wrist = np.asarray(target_hand_rotations_world[frame], dtype=np.float64)
-            wrist_delta = desired_wrist @ global_rotations[frame, wrist_idx].T
-            # Rotate the hand/gripper as one rigid assembly. This preserves the
-            # neutral finger/gripper shape while the forearm + wrist base orient
-            # the tool toward the object.
-            for hand_idx in hand_indices:
-                global_rotations[frame, hand_idx] = wrist_delta @ global_rotations[frame, hand_idx]
+            if np.all(np.isfinite(desired_wrist)):
+                wrist_delta = desired_wrist @ global_rotations[frame, wrist_idx].T
+                # Rotate the hand/gripper as one rigid assembly. This preserves the
+                # neutral finger/gripper shape while the forearm + wrist base orient
+                # the tool toward the object.
+                for hand_idx in hand_indices:
+                    global_rotations[frame, hand_idx] = wrist_delta @ global_rotations[frame, hand_idx]
 
     device = motion.joints_rot.device
     dtype = motion.joints_rot.dtype
@@ -436,19 +454,19 @@ def _freeze_body_except_right_arm(
     motion,
     base_global_rotations: np.ndarray,
     base_root_position: np.ndarray,
+    side: str = "right",
 ) -> None:
     """Keep the outbound standing pose everywhere except the right arm chain."""
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
     skeleton = motion.skeleton
     device = motion.joints_rot.device
     dtype = motion.joints_rot.dtype
     generated_local = global_rots_to_local_rots(motion.joints_rot, skeleton)
     base_global = torch.as_tensor(base_global_rotations, device=device, dtype=dtype)
     base_local = global_rots_to_local_rots(base_global, skeleton)
-    moving_names = {
-        "RightShoulder",
-        "RightArm",
-        "RightForeArm",
-    }
+    prefix = "Left" if side == "left" else "Right"
+    moving_names = {f"{prefix}Shoulder", f"{prefix}Arm", f"{prefix}ForeArm"}
     for joint_index, joint_name in enumerate(skeleton.bone_order_names):
         if joint_name not in moving_names:
             generated_local[:, joint_index] = base_local[joint_index]
@@ -459,6 +477,68 @@ def _freeze_body_except_right_arm(
     motion.joints_local_rot = generated_local
     motion.joints_rot = solved_global
     motion.joints_pos = solved_positions
+
+
+def _freeze_body_except_arm_sides(
+    motion,
+    base_global_rotations: np.ndarray,
+    base_root_position: np.ndarray,
+    sides: set[str],
+) -> None:
+    """Keep the base pose everywhere except the requested arm chains."""
+    if not sides <= {"left", "right"}:
+        raise ValueError("sides must contain only 'left' and/or 'right'")
+    skeleton = motion.skeleton
+    device = motion.joints_rot.device
+    dtype = motion.joints_rot.dtype
+    generated_local = global_rots_to_local_rots(motion.joints_rot, skeleton)
+    base_global = torch.as_tensor(base_global_rotations, device=device, dtype=dtype)
+    base_local = global_rots_to_local_rots(base_global, skeleton)
+    moving_names: set[str] = set()
+    for side in sides:
+        prefix = "Left" if side == "left" else "Right"
+        moving_names.update({f"{prefix}Shoulder", f"{prefix}Arm", f"{prefix}ForeArm"})
+    for joint_index, joint_name in enumerate(skeleton.bone_order_names):
+        if joint_name not in moving_names:
+            generated_local[:, joint_index] = base_local[joint_index]
+    root_positions = torch.as_tensor(base_root_position, device=device, dtype=dtype)[None].repeat(
+        motion.length, 1
+    )
+    solved_global, solved_positions, _ = skeleton.fk(generated_local, root_positions)
+    motion.joints_local_rot = generated_local
+    motion.joints_rot = solved_global
+    motion.joints_pos = solved_positions
+
+
+def _hold_right_arm_local_pose(motion, hold_global_rotations: np.ndarray, side: str = "right") -> None:
+    """Keep the carried object pose fixed relative to the moving body."""
+    if side not in {"left", "right"}:
+        raise ValueError("side must be 'left' or 'right'")
+    skeleton = motion.skeleton
+    device = motion.joints_rot.device
+    dtype = motion.joints_rot.dtype
+    hold_global = torch.as_tensor(hold_global_rotations, device=device, dtype=dtype)
+    hold_local = global_rots_to_local_rots(hold_global, skeleton)
+    local_rotations = global_rots_to_local_rots(motion.joints_rot, skeleton)
+
+    prefix = "Left" if side == "left" else "Right"
+    hand_names = skeleton.left_hand_joint_names if side == "left" else skeleton.right_hand_joint_names
+    hold_names = {
+        f"{prefix}Shoulder",
+        f"{prefix}Arm",
+        f"{prefix}ForeArm",
+        *hand_names,
+    }
+    for joint_index, joint_name in enumerate(skeleton.bone_order_names):
+        if joint_name in hold_names:
+            local_rotations[:, joint_index] = hold_local[joint_index]
+
+    root_positions = motion.joints_pos[:, skeleton.root_idx].clone()
+    solved_global, solved_positions, _ = skeleton.fk(local_rotations, root_positions)
+    motion.joints_local_rot = local_rotations
+    motion.joints_rot = solved_global
+    motion.joints_pos = solved_positions
+    motion.precompute_mesh_info()
 
 
 def _add_rack_to_scene(
@@ -526,6 +606,59 @@ def _add_rack_to_scene(
             f"{root}/label",
             text=name.replace("_", " ").title(),
             position=np.array([0.0, RACK_HEIGHT_M + 0.08, 0.0], dtype=np.float64),
+        )
+    )
+    return handles
+
+
+def _add_counter_table_to_scene(client: viser.ClientHandle) -> list[viser.SceneHandle]:
+    """Build the counter table in front of the robot origin."""
+    root = "/physical_world/counter_table"
+    center_z = COUNTER_TABLE_DISTANCE_FROM_ORIGIN_M + COUNTER_TABLE_WIDTH_M / 2.0
+    handles: list[viser.SceneHandle] = [
+        client.scene.add_frame(
+            root,
+            show_axes=False,
+            position=np.array([0.0, 0.0, center_z], dtype=np.float64),
+        )
+    ]
+
+    top_center_y = COUNTER_TABLE_HEIGHT_M - COUNTER_TABLE_TOP_THICKNESS_M / 2.0
+    leg_height = COUNTER_TABLE_HEIGHT_M - COUNTER_TABLE_TOP_THICKNESS_M
+    handles.append(
+        client.scene.add_box(
+            f"{root}/top",
+            dimensions=(
+                COUNTER_TABLE_LENGTH_M,
+                COUNTER_TABLE_TOP_THICKNESS_M,
+                COUNTER_TABLE_WIDTH_M,
+            ),
+            color=(128, 92, 58),
+            position=np.array([0.0, top_center_y, 0.0], dtype=np.float64),
+        )
+    )
+
+    half_x = COUNTER_TABLE_LENGTH_M / 2.0 - COUNTER_TABLE_LEG_SIZE_M / 2.0
+    half_z = COUNTER_TABLE_WIDTH_M / 2.0 - COUNTER_TABLE_LEG_SIZE_M / 2.0
+    for index, (x_offset, z_offset) in enumerate(
+        ((-half_x, -half_z), (-half_x, half_z), (half_x, -half_z), (half_x, half_z)),
+        start=1,
+    ):
+        handles.append(
+            client.scene.add_box(
+                f"{root}/leg_{index}",
+                dimensions=(COUNTER_TABLE_LEG_SIZE_M, leg_height, COUNTER_TABLE_LEG_SIZE_M),
+                color=(92, 64, 45),
+                position=np.array([x_offset, leg_height / 2.0, z_offset], dtype=np.float64),
+            )
+        )
+
+    handles.append(
+        client.scene.add_box(
+            f"{root}/front_panel",
+            dimensions=(COUNTER_TABLE_LENGTH_M, leg_height * 0.70, 0.025),
+            color=(116, 78, 50),
+            position=np.array([0.0, leg_height * 0.40, half_z], dtype=np.float64),
         )
     )
     return handles
@@ -642,6 +775,7 @@ def _save_pick_constraint_debug_json(
     root_path: np.ndarray,
     right_hand_path: np.ndarray,
     right_hand_start_position: np.ndarray,
+    hand_specs: dict[str, dict[str, object]] | None = None,
     output_dir: Path | None = None,
 ) -> Path:
     """Save the generated shelf-pick constraints in a human-readable JSON file."""
@@ -695,8 +829,113 @@ def _save_pick_constraint_debug_json(
         "root_path_xyz_per_frame": _jsonable_array(root_path),
         "right_hand_path_xyz_per_frame": _jsonable_array(right_hand_path),
     }
+    if hand_specs:
+        hands_payload: dict[str, dict[str, object]] = {}
+        for side, spec in hand_specs.items():
+            object_key = spec.get("object_key")
+            hand_start = spec.get("hand_start_position")
+            if hand_start is None and "hand_root_index" in spec:
+                hand_start = right_hand_start_position if side == "right" else None
+            hands_payload[side] = {
+                "object_key": list(object_key) if object_key is not None else None,
+                "object_index": int(spec["object_index"]),
+                "object_position_xyz": _jsonable_array(spec["object_position"]),
+                "hand_start_xyz": _jsonable_array(hand_start) if hand_start is not None else None,
+                "targets_xyz": {
+                    "pregrasp": _jsonable_array(spec["pregrasp_target"]),
+                    "diagonal_approach": _jsonable_array(spec["diagonal_approach_target"]),
+                    "grasp": _jsonable_array(spec["grasp_target_world"]),
+                    "lift": _jsonable_array(spec["lift_target"]),
+                    "chest_hold": _jsonable_array(spec["chest_target"]),
+                },
+                "hand_path_xyz_per_frame": _jsonable_array(spec["hand_target_path"]),
+                "target_palm_normals_xyz_per_frame": _jsonable_array(spec["target_palm_normals"]),
+                "elbow_bend_hint_xyz": _jsonable_array(spec["elbow_bend_hint"]),
+            }
+        payload["hands"] = hands_payload
+        if "left" in hand_specs:
+            payload["left_hand_path_xyz_per_frame"] = _jsonable_array(
+                hand_specs["left"]["hand_target_path"]
+            )
+        if "right" in hand_specs:
+            payload["right_hand_path_xyz_per_frame"] = _jsonable_array(
+                hand_specs["right"]["hand_target_path"]
+            )
     path = output_dir / f"{stem}.json"
     latest_path = output_dir / "latest_pick_constraints.json"
+    text = json.dumps(payload, indent=2)
+    path.write_text(text, encoding="utf-8")
+    latest_path.write_text(text, encoding="utf-8")
+    return path
+
+
+def _save_counter_place_constraint_debug_json(
+    *,
+    object_key: tuple[str, int, int],
+    total_frames: int,
+    fps: float,
+    root_position: np.ndarray,
+    pre_release_frame: int,
+    release_frame: int,
+    release_hold_end_frame: int,
+    retreat_frame: int,
+    normal_frame: int,
+    object_release_position: np.ndarray,
+    pre_release_target: np.ndarray,
+    release_target: np.ndarray,
+    retreat_target: np.ndarray,
+    normal_target: np.ndarray,
+    root_path: np.ndarray,
+    right_hand_path: np.ndarray,
+    right_hand_start_position: np.ndarray,
+    output_dir: Path | None = None,
+) -> Path:
+    """Save generated counter-placement constraints in a human-readable JSON file."""
+    output_dir = output_dir or (Path.cwd() / "robot_demo_outputs" / "place_constraints")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rack_name, shelf_number, object_index = object_key
+    stem = (
+        f"{time.strftime('%Y%m%d_%H%M%S')}_"
+        f"{rack_name}_shelf_{shelf_number}_object_{object_index}_counter_place_constraints"
+    )
+    payload = {
+        "task": "counter_place_release",
+        "rack": rack_name,
+        "object_index": int(object_index),
+        "shelf_number": int(shelf_number),
+        "total_frames": int(total_frames),
+        "fps": float(fps),
+        "duration_seconds": float(total_frames / max(fps, 1e-9)),
+        "policy": {
+            "root": "stationary at counter/origin",
+            "body": "frozen from carry-return final pose",
+            "right_arm": "pre-release, release, wait 1s, slight backward retreat, normal pose",
+            "object": "attached to right hand until release frame, then left safely on counter",
+            "left_arm_feet_body": "held still",
+        },
+        "root_position_xyz": _jsonable_array(root_position),
+        "object_release_position_xyz": _jsonable_array(object_release_position),
+        "keyframes": {
+            "start": 0,
+            "pre_release": int(pre_release_frame),
+            "release": int(release_frame),
+            "release_hold_end": int(release_hold_end_frame),
+            "retreat": int(retreat_frame),
+            "normal": int(normal_frame),
+            "end": int(total_frames - 1),
+        },
+        "targets_xyz": {
+            "right_hand_start": _jsonable_array(right_hand_start_position),
+            "pre_release": _jsonable_array(pre_release_target),
+            "release": _jsonable_array(release_target),
+            "retreat": _jsonable_array(retreat_target),
+            "normal": _jsonable_array(normal_target),
+        },
+        "root_path_xyz_per_frame": _jsonable_array(root_path),
+        "right_hand_path_xyz_per_frame": _jsonable_array(right_hand_path),
+    }
+    path = output_dir / f"{stem}.json"
+    latest_path = output_dir / "latest_place_constraints.json"
     text = json.dumps(payload, indent=2)
     path.write_text(text, encoding="utf-8")
     latest_path.write_text(text, encoding="utf-8")
@@ -709,12 +948,15 @@ def _default_output_root() -> Path:
 
 def _scan_memory_stems(memories_root: Path) -> list[str]:
     bvh_root = memories_root / "bvh"
-    csv_root = memories_root / "t2_csv"
+    t2_csv_root = memories_root / "t2_csv"
+    t3_csv_root = memories_root / "t3_csv"
     stems: set[str] = set()
     if bvh_root.is_dir():
         stems.update(str(path.relative_to(bvh_root).with_suffix("")) for path in bvh_root.rglob("*.bvh"))
-    if csv_root.is_dir():
-        stems.update(str(path.relative_to(csv_root).with_suffix("")) for path in csv_root.rglob("*.csv"))
+    if t3_csv_root.is_dir():
+        stems.update(str(path.relative_to(t3_csv_root).with_suffix("")) for path in t3_csv_root.rglob("*.csv"))
+    if t2_csv_root.is_dir():
+        stems.update(str(path.relative_to(t2_csv_root).with_suffix("")) for path in t2_csv_root.rglob("*.csv"))
     return sorted(stems)
 
 
@@ -734,6 +976,10 @@ def _memory_bvh_path(memories_root: Path, stem: str) -> Path:
 
 def _memory_csv_path(memories_root: Path, stem: str) -> Path:
     return memories_root / "t2_csv" / Path(stem).with_suffix(".csv")
+
+
+def _memory_t3_csv_path(memories_root: Path, stem: str) -> Path:
+    return memories_root / "t3_csv" / Path(stem).with_suffix(".csv")
 
 
 def _base_memory_csv_path(memories_root: Path, stem: str) -> Path:
@@ -788,13 +1034,18 @@ def _resolve_base_memory_stem(requested: str, memories_root: Path) -> str:
 
 def _memory_label(memories_root: Path, stem: str) -> str:
     has_bvh = _memory_bvh_path(memories_root, stem).is_file()
-    has_csv = _memory_csv_path(memories_root, stem).is_file()
-    if has_bvh and has_csv:
-        state = "bvh+csv"
+    has_t3_csv = _memory_t3_csv_path(memories_root, stem).is_file()
+    has_t2_csv = _memory_csv_path(memories_root, stem).is_file()
+    if has_bvh and has_t3_csv:
+        state = "bvh+t3"
+    elif has_bvh and has_t2_csv:
+        state = "bvh+t2"
     elif has_bvh:
-        state = "needs csv"
-    elif has_csv:
-        state = "csv only"
+        state = "needs robot csv"
+    elif has_t3_csv:
+        state = "t3 only"
+    elif has_t2_csv:
+        state = "t2 only"
     else:
         state = "missing"
     return f"[{state}] {stem}"
@@ -812,6 +1063,340 @@ def _outbound_rack_from_memory_stem(stem: str) -> str | None:
     if not any(word in normalized for word in ("move", "walk", "rack")):
         return None
     return requested_rack_name([str(stem)])
+
+
+def _pick_request_from_memory_stem(stem: str):
+    """Best-effort pick request detection for loaded pick memories."""
+    normalized = " ".join(str(stem).lower().replace("_", " ").replace("-", " ").split())
+    return requested_rack_pick([normalized])
+
+
+@dataclass(frozen=True)
+class DualRackPickRequest:
+    rack_name: str
+    shelf_number: int
+    object_indices: tuple[int, int] = (1, 3)
+
+
+def _requested_dual_rack_pick(prompts: list[str]) -> DualRackPickRequest | None:
+    """Parse two-hand shelf picks for objects 1 and 3."""
+    if len(prompts) != 1:
+        return None
+    prompt = prompts[0]
+    normalized = " ".join(prompt.strip().lower().replace("_", " ").split())
+    if not re.search(r"\b(?:pick|take|grab)\b", normalized):
+        return None
+    object_numbers = {int(value) for value in re.findall(r"\b(?:objects?|items?|objs?)\s*[_-]?(\d+)\b", normalized)}
+    pair_match = re.search(
+        r"\b(?:objects?|items?|objs?)\s*[_-]?(\d+)\s*(?:and|&|,)\s*(?:(?:objects?|items?|objs?)\s*[_-]?)?(\d+)\b",
+        normalized,
+    )
+    if pair_match is not None:
+        object_numbers.update(int(value) for value in pair_match.groups())
+    if object_numbers != {1, 3}:
+        return None
+    if "both hand" not in normalized and "both arms" not in normalized and "two object" not in normalized and "2 object" not in normalized:
+        return None
+    rack_name = requested_rack_name(prompts)
+    shelf_match = re.search(r"\bshelf\s*[_-]?(\d+)\b", normalized)
+    if rack_name is None or shelf_match is None:
+        return None
+    shelf_number = int(shelf_match.group(1))
+    if shelf_number not in {1, 2, 3, 4, 5}:
+        raise ValueError("Rack shelf number must be 1, 2, 3, 4, or 5")
+    return DualRackPickRequest(rack_name=rack_name, shelf_number=shelf_number)
+
+
+@dataclass(frozen=True)
+class RackTransferRequest:
+    source_rack: str
+    target_rack: str
+
+
+@dataclass(frozen=True)
+class RackTransferRoute:
+    positions: tuple[tuple[float, float, float], ...]
+    headings: tuple[float, ...]
+    final_heading: float
+    turn_degrees: tuple[int, ...]
+    reverse_end_frame: int = 0
+
+
+def _requested_rack_transfer(prompts: list[str]) -> RackTransferRequest | None:
+    """Parse explicit human routes like ``move from rack 1 to rack 2``."""
+    if len(prompts) != 1:
+        return None
+    normalized = " ".join(prompts[0].strip().lower().replace("_", " ").split())
+    if "base" in normalized or not re.search(r"\b(?:move|walk|go|navigate)\b", normalized):
+        return None
+    match = re.search(
+        r"\bfrom\s+rack\s*(\d+)\b.*\bto\s+rack\s*(\d+)\b",
+        normalized,
+        re.IGNORECASE,
+    )
+    if match is None:
+        return None
+    source_rack = f"rack_{int(match.group(1))}"
+    target_rack = f"rack_{int(match.group(2))}"
+    if source_rack == target_rack:
+        raise ValueError("Rack-to-rack motion needs two different racks.")
+    return RackTransferRequest(source_rack, target_rack)
+
+
+def _requested_counter_place(prompts: list[str]) -> bool:
+    """Return True for explicit object release/place-on-counter prompts."""
+    if len(prompts) != 1:
+        return False
+    normalized = " ".join(prompts[0].strip().lower().replace("_", " ").split())
+    if not re.search(r"\b(?:place|release|drop|put)\b", normalized):
+        return False
+    return "counter" in normalized or "conter" in normalized or "table" in normalized
+
+
+def _minimum_generate_duration_seconds(prompts: list[str], fps: float) -> float | None:
+    if _requested_dual_rack_pick(prompts) is not None or requested_rack_pick(prompts) is not None:
+        return 7.0
+    transfer_request = _requested_rack_transfer(prompts)
+    if transfer_request is not None:
+        for rack_name in (transfer_request.source_rack, transfer_request.target_rack):
+            if rack_name not in RACK_MAP_POSITIONS:
+                return None
+        x_near = WORK_AREA_SIDE_SHIFT_M
+        x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
+        z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
+        source_target, source_heading = rack_width_side_approach_pose(
+            RACK_MAP_POSITIONS[transfer_request.source_rack],
+            RACK_MAP_YAWS_RAD.get(transfer_request.source_rack, 0.0),
+            RACK_WIDTH_M,
+            RACK_HUMAN_APPROACH_CLEARANCE_M,
+            (x_far, x_near),
+            (z_far, 0.0),
+        )
+        target_position, target_heading = rack_width_side_approach_pose(
+            RACK_MAP_POSITIONS[transfer_request.target_rack],
+            RACK_MAP_YAWS_RAD.get(transfer_request.target_rack, 0.0),
+            RACK_WIDTH_M,
+            RACK_HUMAN_APPROACH_CLEARANCE_M,
+            (x_far, x_near),
+            (z_far, 0.0),
+        )
+        distance = abs(float(target_position[0]) - float(source_target[0])) + abs(
+            float(target_position[2]) - float(source_target[2])
+        )
+        heading_delta = abs(_normalize_heading(target_heading - source_heading))
+        return 1.0 + distance / _rack_human_walk_speed_m_s(transfer_request.target_rack) + (
+            0.90 * heading_delta / (math.pi / 2.0)
+        )
+
+    rack_name = requested_rack_name(prompts)
+    if rack_name is None:
+        return None
+
+    normalized = " | ".join(prompts).lower()
+    if not re.search(r"\b(move|walk|go|navigate)\b", normalized):
+        return None
+    if rack_name not in RACK_MAP_POSITIONS:
+        return None
+
+    x_near = WORK_AREA_SIDE_SHIFT_M
+    x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
+    z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
+    rack_target, rack_facing_heading = rack_width_side_approach_pose(
+        RACK_MAP_POSITIONS[rack_name],
+        RACK_MAP_YAWS_RAD.get(rack_name, 0.0),
+        RACK_WIDTH_M,
+        RACK_HUMAN_APPROACH_CLEARANCE_M,
+        (x_far, x_near),
+        (z_far, 0.0),
+    )
+    required_seconds = cardinal_rack_route_required_seconds(
+        approach_position=rack_target,
+        final_heading=rack_facing_heading,
+        fps=fps,
+        walk_speed_m_s=_rack_human_walk_speed_m_s(rack_name),
+        first_axis="z" if rack_name in {"rack_1", "rack_2", "rack_3"} else "x",
+    )
+    return required_seconds + 1.0
+
+
+def _rack_human_walk_speed_m_s(rack_name: str) -> float:
+    if rack_name in {"rack_3", "rack_4"}:
+        return RACK_HUMAN_FAST_WALK_SPEED_M_S
+    return RACK_HUMAN_SLOW_WALK_SPEED_M_S
+
+
+def _heading_between_positions(start: tuple[float, float, float], end: tuple[float, float, float]) -> float:
+    delta_x = float(end[0]) - float(start[0])
+    delta_z = float(end[2]) - float(start[2])
+    if math.isclose(delta_x, 0.0, abs_tol=1e-9) and math.isclose(delta_z, 0.0, abs_tol=1e-9):
+        raise ValueError("Route points must be different to compute a heading.")
+    return math.atan2(delta_x, delta_z)
+
+
+def _normalize_heading(angle: float) -> float:
+    return (float(angle) + math.pi) % (2.0 * math.pi) - math.pi
+
+
+def _append_route_point(
+    points: list[tuple[float, float, float]],
+    point: tuple[float, float, float],
+) -> None:
+    if not points or any(
+        not math.isclose(a, b, abs_tol=1e-9)
+        for a, b in zip(points[-1], point)
+    ):
+        points.append(point)
+
+
+def _plan_cardinal_rack_transfer_route(
+    *,
+    start_position: tuple[float, float, float],
+    start_heading: float,
+    target_position: tuple[float, float, float],
+    final_heading: float,
+    total_frames: int,
+    fps: float,
+    walk_speed_m_s: float,
+    turn_seconds_per_90: float = 0.90,
+    first_axis: str = "x",
+    reverse_distance: float = 0.12,
+    reverse_seconds: float = 0.50,
+) -> RackTransferRoute:
+    """Plan a cardinal route from one rack approach pose to another."""
+    if (
+        total_frames < 2
+        or fps <= 0.0
+        or walk_speed_m_s <= 0.0
+        or reverse_distance < 0.0
+        or (reverse_distance > 0.0 and reverse_seconds <= 0.0)
+    ):
+        raise ValueError("total_frames, fps, walk_speed_m_s, and reverse settings must be positive")
+    if first_axis not in {"x", "z"}:
+        raise ValueError("first_axis must be x or z")
+
+    start = tuple(float(value) for value in start_position)
+    target = tuple(float(value) for value in target_position)
+    heading_vector = (math.sin(float(start_heading)), math.cos(float(start_heading)))
+    target_heading_vector = (math.sin(float(final_heading)), math.cos(float(final_heading)))
+    backed = (
+        start[0] - reverse_distance * heading_vector[0],
+        0.0,
+        start[2] - reverse_distance * heading_vector[1],
+    )
+    target_backed = (
+        target[0] - reverse_distance * target_heading_vector[0],
+        0.0,
+        target[2] - reverse_distance * target_heading_vector[1],
+    )
+    points = [backed if reverse_distance > 0.0 else start]
+    if first_axis == "x":
+        _append_route_point(points, (target_backed[0], 0.0, points[0][2]))
+    else:
+        _append_route_point(points, (points[0][0], 0.0, target_backed[2]))
+    _append_route_point(points, target_backed)
+
+    actions: list[tuple[str, object]] = []
+    current_heading = float(start_heading)
+    turn_values: list[float] = []
+    if reverse_distance > 0.0:
+        actions.append(("reverse", (start, backed, float(start_heading))))
+    for segment_start, segment_end in zip(points[:-1], points[1:]):
+        move_heading = _heading_between_positions(segment_start, segment_end)
+        turn_delta = _normalize_heading(move_heading - current_heading)
+        if not math.isclose(turn_delta, 0.0, abs_tol=1e-8):
+            actions.append(("turn", turn_delta))
+            turn_values.append(turn_delta)
+        actions.append(("move", (segment_start, segment_end)))
+        current_heading = move_heading
+
+    final_turn = _normalize_heading(final_heading - current_heading)
+    if not math.isclose(final_turn, 0.0, abs_tol=1e-8):
+        actions.append(("turn", final_turn))
+        turn_values.append(final_turn)
+    if reverse_distance > 0.0:
+        actions.append(("move", (target_backed, target)))
+
+    turn_steps = [
+        max(1, int(round(turn_seconds_per_90 * fps * abs(float(value)) / (math.pi / 2.0))))
+        for kind, value in actions
+        if kind == "turn"
+    ]
+    move_distances = [
+        math.hypot(value[1][0] - value[0][0], value[1][2] - value[0][2])
+        for kind, value in actions
+        if kind in {"move", "reverse"}
+    ]
+    move_steps = []
+    for kind, value in actions:
+        if kind == "reverse":
+            move_steps.append(max(1, int(round(reverse_seconds * fps))))
+        elif kind == "move":
+            distance = math.hypot(value[1][0] - value[0][0], value[1][2] - value[0][2])
+            move_steps.append(max(1, int(round(distance / walk_speed_m_s * fps))))
+    required_steps = sum(turn_steps) + sum(move_steps)
+    if required_steps > total_frames - 1:
+        required_seconds = (required_steps + 1) / max(fps, 1e-9)
+        raise ValueError(
+            f"Rack-to-rack motion is too short; use at least {math.ceil(required_seconds)} seconds."
+        )
+
+    positions = [start]
+    headings = [float(start_heading)]
+    position = start
+    heading = float(start_heading)
+    turn_index = 0
+    move_index = 0
+    reverse_end_frame = 0
+    for kind, value in actions:
+        if kind == "turn":
+            steps = turn_steps[turn_index]
+            turn_index += 1
+            delta = float(value)
+            for step in range(1, steps + 1):
+                positions.append(position)
+                headings.append(_normalize_heading(heading + delta * step / steps))
+            heading = _normalize_heading(heading + delta)
+            continue
+
+        steps = move_steps[move_index]
+        move_index += 1
+        if kind == "reverse":
+            segment_start, segment_end, fixed_heading = value
+            heading = float(fixed_heading)
+        else:
+            segment_start, segment_end = value
+            heading = _heading_between_positions(segment_start, segment_end)
+        for step in range(1, steps + 1):
+            ratio = step / steps
+            position = tuple(
+                float(segment_start[axis] + ratio * (segment_end[axis] - segment_start[axis]))
+                for axis in range(3)
+            )
+            positions.append(position)
+            headings.append(heading)
+        if kind == "reverse":
+            reverse_end_frame = len(positions) - 1
+
+    while len(positions) < total_frames:
+        positions.append(target)
+        headings.append(float(final_heading))
+
+    if len(positions) != total_frames:
+        raise AssertionError(f"Expected {total_frames} route frames, generated {len(positions)}")
+    return RackTransferRoute(
+        positions=tuple(positions),
+        headings=tuple(headings),
+        final_heading=_normalize_heading(final_heading),
+        turn_degrees=tuple(int(round(abs(math.degrees(value)))) for value in turn_values),
+        reverse_end_frame=reverse_end_frame,
+    )
+
+
+def _resolve_generate_duration_seconds(prompts: list[str], requested_duration: float, fps: float) -> float:
+    tool_duration = _minimum_generate_duration_seconds(prompts, fps)
+    if tool_duration is None:
+        return requested_duration
+    return tool_duration
 
 
 def _stem_from_memory_label(label: str) -> str:
@@ -1171,17 +1756,31 @@ class RobotWorkflowState:
     freeze_t3_base: bool = False
     base_route_rack: str | None = None
     base_route_kind: str | None = None
-    rack_object_handles: dict[tuple[str, int], viser.SceneHandle] = field(default_factory=dict)
-    rack_object_home_positions: dict[tuple[str, int], np.ndarray] = field(default_factory=dict)
-    picked_rack_object: tuple[str, int] | None = None
+    rack_object_handles: dict[tuple[str, int, int], viser.SceneHandle] = field(default_factory=dict)
+    rack_object_home_positions: dict[tuple[str, int, int], np.ndarray] = field(default_factory=dict)
+    picked_rack_object: tuple[str, int, int] | None = None
+    picked_rack_objects_by_hand: dict[str, tuple[str, int, int]] = field(default_factory=dict)
+    pick_hand_side: str = "right"
     pick_hold_start_frame: int | None = None
+    pick_hold_start_frames_by_side: dict[str, int] = field(default_factory=dict)
     pick_object_hand_offset: np.ndarray | None = None
+    pick_object_hand_offsets_by_side: dict[str, np.ndarray] = field(default_factory=dict)
     pick_reach_start_frame: int | None = None
     pick_hand_target_world: np.ndarray | None = None
     pick_target_path_world: np.ndarray | None = None
     pick_grasp_target_world: np.ndarray | None = None
     pick_grasp_verified: bool = False
     pick_elbow_bend_hint_world: np.ndarray | None = None
+    place_release_frame: int | None = None
+    place_object_position_world: np.ndarray | None = None
+    place_object_positions_by_hand: dict[str, np.ndarray] = field(default_factory=dict)
+    place_reach_start_frame: int | None = None
+    place_hand_target_world: np.ndarray | None = None
+    place_hand_targets_by_side: dict[str, np.ndarray] = field(default_factory=dict)
+    place_target_path_world: np.ndarray | None = None
+    place_target_paths_by_side: dict[str, np.ndarray] = field(default_factory=dict)
+    place_elbow_bend_hint_world: np.ndarray | None = None
+    place_elbow_bend_hints_by_side: dict[str, np.ndarray] = field(default_factory=dict)
 
     def clear_t2_preview(
         self,
@@ -1220,6 +1819,21 @@ class RobotWorkflowState:
         self.placed_object_count = 0
 
 
+@dataclass
+class RemoteT2RetargetJob:
+    output_root: Path
+    relative_stem: Path
+    csv_path: Path
+
+
+@dataclass
+class RemoteT3RetargetJob:
+    output_root: Path
+    relative_stem: Path
+    t3_csv_path: Path
+    wheel_csv_path: Path
+
+
 class RobotDemo(Demo):
     """Kimodo demo with a robot production workflow mounted as a separate panel."""
 
@@ -1237,6 +1851,7 @@ class RobotDemo(Demo):
         tara_rpm_scale: float = 1.0,
         tara_debug: bool = False,
         model_server_url: str | None = None,
+        retarget_server_url: str | None = None,
     ):
         super().__init__(default_model_name=default_model_name, model_server_url=model_server_url)
         self.robot_workflows: dict[int, RobotWorkflowState] = {}
@@ -1249,6 +1864,7 @@ class RobotDemo(Demo):
         self.tara_max_rpm = tara_max_rpm
         self.tara_rpm_scale = tara_rpm_scale
         self.tara_debug = tara_debug
+        self.retarget_server_url = retarget_server_url.rstrip("/") if retarget_server_url else None
         self._world_scene_data: dict[str, np.ndarray | str] | None = None
         self._world_scene_data_path: Path | None = None
         self._world_scene_lock = threading.Lock()
@@ -1288,6 +1904,7 @@ class RobotDemo(Demo):
                 RACK_MAP_YAWS_RAD.get(name, 0.0),
             )
         ]
+        self.rack_scene_handles[client.client_id].extend(_add_counter_table_to_scene(client))
         self._create_world_scene_gui(client)
         self._hide_examples_folder(client)
         workflow = RobotWorkflowState()
@@ -1833,7 +2450,18 @@ class RobotDemo(Demo):
                 self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
                 self.end_headers()
 
-        self._control_server = http.server.ThreadingHTTPServer((host, port), ControlHandler)
+        class ReusableThreadingHTTPServer(http.server.ThreadingHTTPServer):
+            allow_reuse_address = True
+
+        try:
+            self._control_server = ReusableThreadingHTTPServer((host, port), ControlHandler)
+        except OSError as exc:
+            if exc.errno == errno.EADDRINUSE:
+                raise RuntimeError(
+                    f"Kimodo control API port {port} is already in use on {host}. "
+                    f"Stop the existing robot_app.py process or run with --control-port {port + 1}."
+                ) from exc
+            raise
         thread = threading.Thread(
             target=self._control_server.serve_forever,
             name="kimodo-control-server",
@@ -1854,7 +2482,80 @@ class RobotDemo(Demo):
             current["updated_at"] = time.time()
             self._control_jobs[job_id] = current
 
+    def _retarget_relative_stem(self, bvh_path: Path, output_root: Path) -> Path:
+        try:
+            return bvh_path.relative_to(output_root / "bvh").with_suffix("")
+        except ValueError:
+            return Path(bvh_path.stem)
+
+    def _decode_remote_file(self, response: dict[str, object], *keys: str) -> bytes:
+        for key in keys:
+            value = response.get(key)
+            if isinstance(value, str) and value:
+                return base64.b64decode(value)
+        raise KeyError(f"Retarget server response missing one of: {', '.join(keys)}")
+
+    def _post_remote_retarget(self, target: str, bvh_path: Path, output_root: Path) -> dict[str, object]:
+        if self.retarget_server_url is None:
+            raise RuntimeError("No remote retarget server URL configured")
+        bvh_bytes = bvh_path.read_bytes()
+        relative_stem = self._retarget_relative_stem(bvh_path, output_root)
+        payload = {
+            "bvh_base64": base64.b64encode(bvh_bytes).decode("ascii"),
+            "stem": str(relative_stem),
+            "target": target,
+        }
+        request = urllib.request.Request(
+            f"{self.retarget_server_url}/retarget/{target}",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=600) as response:
+                return json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"Remote retarget server failed with HTTP {exc.code}: {detail}") from exc
+
+    def _run_remote_retarget_bvh_to_csv(self, bvh_path: Path, output_root: Path) -> tuple[RemoteT2RetargetJob, Path]:
+        response = self._post_remote_retarget("t2", bvh_path, output_root)
+        relative_stem = Path(str(response.get("stem") or self._retarget_relative_stem(bvh_path, output_root)))
+        csv_path = output_root / "t2_csv" / relative_stem.with_suffix(".csv")
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.write_bytes(self._decode_remote_file(response, "csv_base64", "t2_csv_base64"))
+
+        log_path = output_root / "logs" / relative_stem.with_suffix(".retarget.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(str(response.get("log") or response.get("stdout") or ""), encoding="utf-8")
+        return RemoteT2RetargetJob(output_root=output_root, relative_stem=relative_stem, csv_path=csv_path), log_path
+
+    def _run_remote_retarget_bvh_to_t3_csv(self, bvh_path: Path, output_root: Path) -> tuple[RemoteT3RetargetJob, Path]:
+        response = self._post_remote_retarget("t3", bvh_path, output_root)
+        relative_stem = Path(str(response.get("stem") or self._retarget_relative_stem(bvh_path, output_root)))
+        t3_csv_path = output_root / "t3_csv" / relative_stem.with_suffix(".csv")
+        wheel_csv_path = output_root / "wheel_csv" / relative_stem.with_name(
+            f"{relative_stem.name}_diff_drive.csv"
+        )
+        t3_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        wheel_csv_path.parent.mkdir(parents=True, exist_ok=True)
+        t3_csv_path.write_bytes(self._decode_remote_file(response, "t3_csv_base64", "csv_base64"))
+        wheel_csv_path.write_bytes(self._decode_remote_file(response, "wheel_csv_base64"))
+
+        log_path = output_root / "logs" / relative_stem.with_suffix(".t3_retarget.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(str(response.get("log") or response.get("stdout") or ""), encoding="utf-8")
+        job = RemoteT3RetargetJob(
+            output_root=output_root,
+            relative_stem=relative_stem,
+            t3_csv_path=t3_csv_path,
+            wheel_csv_path=wheel_csv_path,
+        )
+        return job, log_path
+
     def _run_headless_retarget_bvh_to_csv(self, bvh_path: Path, output_root: Path) -> tuple[SomaT2RetargetJob, Path]:
+        if self.retarget_server_url:
+            return self._run_remote_retarget_bvh_to_csv(bvh_path, output_root)
         job = SomaT2RetargetJob(
             retargeter_root=default_soma_retargeter_root(),
             bvh_path=bvh_path,
@@ -1869,6 +2570,27 @@ class RobotDemo(Demo):
             raise RuntimeError(f"soma-retargeter failed with exit code {result.returncode}. Log: {log_path}")
         if not job.csv_path.is_file():
             raise FileNotFoundError(f"Expected retarget CSV was not created: {job.csv_path}")
+        return job, log_path
+
+    def _run_headless_retarget_bvh_to_t3_csv(self, bvh_path: Path, output_root: Path) -> tuple[SomaT3RetargetJob | RemoteT3RetargetJob, Path]:
+        if self.retarget_server_url:
+            return self._run_remote_retarget_bvh_to_t3_csv(bvh_path, output_root)
+        job = SomaT3RetargetJob(
+            retargeter_root=default_soma_retargeter_root(),
+            bvh_path=bvh_path,
+            output_root=output_root,
+            conda_env=os.environ.get("KIMODO_RETARGET_CONDA_ENV", "soma-retargeter"),
+        )
+        result = job.run()
+        log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".t3_retarget.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.write_text(result.stdout or "", encoding="utf-8")
+        if result.returncode != 0:
+            raise RuntimeError(f"T3 retargeter failed with exit code {result.returncode}. Log: {log_path}")
+        if not job.t3_csv_path.is_file():
+            raise FileNotFoundError(f"Expected T3 CSV was not created: {job.t3_csv_path}")
+        if not job.wheel_csv_path.is_file():
+            raise FileNotFoundError(f"Expected T3 wheel CSV was not created: {job.wheel_csv_path}")
         return job, log_path
 
     def _save_headless_bvh(
@@ -1944,7 +2666,7 @@ class RobotDemo(Demo):
 
         bundle = self.load_model(model_name)
         duration = float(payload.get("duration_seconds") or DEFAULT_CUR_DURATION)
-        duration = max(0.1, duration)
+        duration = max(0.1, _resolve_generate_duration_seconds(prompts, duration, float(bundle.model_fps)))
         seed = int(payload.get("seed") or 42)
         diffusion_steps = int(payload.get("diffusion_steps") or 100)
         stem = str(payload.get("stem") or "").strip() or _new_generated_stem()
@@ -2006,15 +2728,18 @@ class RobotDemo(Demo):
                     standard_tpose=standard_tpose,
                 )
 
-                self._set_control_job(job_id, status="retargeting", bvh_path=str(bvh_path))
-                retarget_job, log_path = self._run_headless_retarget_bvh_to_csv(bvh_path, output_root)
+                self._set_control_job(job_id, status="retargeting", bvh_path=str(bvh_path), retarget_target="t3")
+                retarget_job, log_path = self._run_headless_retarget_bvh_to_t3_csv(bvh_path, output_root)
                 self._set_control_job(
                     job_id,
                     status="done",
                     stem=str(retarget_job.relative_stem),
                     bvh_path=str(bvh_path),
-                    csv_path=str(retarget_job.csv_path),
+                    csv_path=str(retarget_job.t3_csv_path),
+                    t3_csv_path=str(retarget_job.t3_csv_path),
+                    wheel_csv_path=str(retarget_job.wheel_csv_path),
                     log_path=str(log_path),
+                    retarget_target="t3",
                 )
             except Exception as exc:
                 self._set_control_job(job_id, status="error", error=str(exc))
@@ -2445,36 +3170,67 @@ class RobotDemo(Demo):
         workflow = self.robot_workflows.get(client_id)
         if workflow is None:
             return
+        held_objects = dict(workflow.picked_rack_objects_by_hand)
         if workflow.picked_rack_object is not None:
-            object_handle = workflow.rack_object_handles.get(workflow.picked_rack_object)
-            home_position = workflow.rack_object_home_positions.get(workflow.picked_rack_object)
+            held_objects.setdefault(workflow.pick_hand_side, workflow.picked_rack_object)
+        if held_objects:
             session = self.client_sessions.get(client_id)
-            if object_handle is not None and home_position is not None:
+            for hand_side, object_key in held_objects.items():
+                object_handle = workflow.rack_object_handles.get(object_key)
+                home_position = workflow.rack_object_home_positions.get(object_key)
+                if object_handle is None or home_position is None:
+                    continue
                 if (
-                    workflow.pick_hold_start_frame is not None
-                    and frame_idx >= workflow.pick_hold_start_frame
+                    workflow.place_release_frame is not None
+                    and frame_idx >= workflow.place_release_frame
+                ):
+                    placed_position = workflow.place_object_positions_by_hand.get(hand_side)
+                    if placed_position is None:
+                        placed_position = workflow.place_object_position_world
+                    if placed_position is not None:
+                        object_handle.position = placed_position
+                    else:
+                        object_handle.position = home_position
+                elif (
+                    (
+                        hold_start_frame := workflow.pick_hold_start_frames_by_side.get(
+                            hand_side,
+                            workflow.pick_hold_start_frame,
+                        )
+                    )
+                    is not None
+                    and frame_idx >= hold_start_frame
                     and session is not None
                     and session.motions
                 ):
                     motion = next(iter(session.motions.values()))
-                    hand_name = motion.skeleton.right_hand_joint_names[0]
+                    active_hand_names = (
+                        motion.skeleton.left_hand_joint_names
+                        if hand_side == "left"
+                        else motion.skeleton.right_hand_joint_names
+                    )
+                    hand_label = "Left" if hand_side == "left" else "Right"
+                    hand_name = active_hand_names[0]
                     hand_index = motion.skeleton.bone_order_names.index(hand_name)
                     middle_name = (
-                        "RightHandMiddleEnd"
-                        if "RightHandMiddleEnd" in motion.skeleton.bone_order_names
-                        else motion.skeleton.right_hand_joint_names[-1]
+                        f"{hand_label}HandMiddleEnd"
+                        if f"{hand_label}HandMiddleEnd" in motion.skeleton.bone_order_names
+                        else active_hand_names[-1]
                     )
                     middle_index = motion.skeleton.bone_order_names.index(middle_name)
                     motion_frame = min(int(frame_idx), motion.length - 1)
                     wrist_position = motion.joints_pos[motion_frame, hand_index].detach().cpu().numpy()
                     middle_position = motion.joints_pos[motion_frame, middle_index].detach().cpu().numpy()
                     palm_position = 0.35 * wrist_position + 0.65 * middle_position
-                    hand_offset_local = (
-                        workflow.pick_object_hand_offset
-                        if workflow.pick_object_hand_offset is not None
-                        else np.zeros(3, dtype=np.float64)
-                    )
-                    if workflow.pick_grasp_verified:
+                    hand_offset_local = workflow.pick_object_hand_offsets_by_side.get(hand_side)
+                    hand_has_saved_offset = hand_offset_local is not None
+                    if hand_offset_local is None:
+                        hand_offset_local = (
+                            workflow.pick_object_hand_offset
+                            if workflow.pick_object_hand_offset is not None
+                            else np.zeros(3, dtype=np.float64)
+                        )
+                    if workflow.pick_grasp_verified or hand_has_saved_offset:
                         hand_rotation = (
                             motion.joints_rot[motion_frame, hand_index].detach().cpu().numpy()
                         )
@@ -2489,17 +3245,103 @@ class RobotDemo(Demo):
             workflow.t3_motion.apply_frame(frame_idx)
         if workflow.wheel_base is not None:
             workflow.wheel_base.apply_frame(0 if workflow.freeze_t3_base else frame_idx)
-        if (
-            workflow.connection.is_connected()
-            and (workflow.arm_frames or workflow.base_wheel_rpms)
-            and workflow.stream_real_robot_playback
-        ):
-            try:
-                self._send_robot_frame(workflow, frame_idx)
-            except Exception as exc:
-                workflow.connection.disconnect()
-                if workflow.robot_markdown is not None:
-                    workflow.robot_markdown.content = f"Streaming stopped.\n\n`{exc}`"
+
+    def restore_robot_memory_state_from_loaded_motion(
+        self,
+        client: viser.ClientHandle,
+        source_label: str,
+    ) -> None:
+        """Restore rack/pick workflow state after a BVH is loaded through the generic UI."""
+        session = self.client_sessions.get(client.client_id)
+        workflow = self.robot_workflows.get(client.client_id)
+        if session is None or workflow is None or not session.motions:
+            return
+
+        labels = [source_label, Path(source_label).stem]
+        outbound_rack = next(
+            (rack for label in labels if (rack := _outbound_rack_from_memory_stem(label)) is not None),
+            None,
+        )
+        pick_request = next(
+            (request for label in labels if (request := _pick_request_from_memory_stem(label)) is not None),
+            None,
+        )
+        motion = next(iter(session.motions.values()))
+        if outbound_rack is not None:
+            session.human_outbound_rack_poses[outbound_rack] = (
+                motion.joints_pos[-1].detach().cpu().numpy().copy(),
+                motion.joints_rot[-1].detach().cpu().numpy().copy(),
+            )
+            session.human_route_rack = outbound_rack
+            session.human_route_kind = "outbound"
+            return
+
+        if pick_request is None:
+            return
+        object_key = (
+            pick_request.rack_name,
+            pick_request.shelf_number,
+            pick_request.object_index,
+        )
+        object_position = workflow.rack_object_home_positions.get(object_key)
+        if object_position is None:
+            return
+        restored_hand_side = "left" if pick_request.object_index == 3 else "right"
+        restored_hand_names = (
+            motion.skeleton.left_hand_joint_names
+            if restored_hand_side == "left"
+            else motion.skeleton.right_hand_joint_names
+        )
+        restored_hand_label = "Left" if restored_hand_side == "left" else "Right"
+        hand_name = restored_hand_names[0]
+        hand_index = motion.skeleton.bone_order_names.index(hand_name)
+        middle_name = (
+            f"{restored_hand_label}HandMiddleEnd"
+            if f"{restored_hand_label}HandMiddleEnd" in motion.skeleton.bone_order_names
+            else restored_hand_names[-1]
+        )
+        middle_index = motion.skeleton.bone_order_names.index(middle_name)
+        attach_frame = min(
+            motion.length - 1,
+            max(0, int(round(motion.length * 0.52))),
+        )
+        wrist_attach = motion.joints_pos[attach_frame, hand_index].detach().cpu().numpy()
+        middle_attach = motion.joints_pos[attach_frame, middle_index].detach().cpu().numpy()
+        palm_attach = 0.35 * wrist_attach + 0.65 * middle_attach
+        hand_rotation_attach = motion.joints_rot[attach_frame, hand_index].detach().cpu().numpy()
+
+        workflow.picked_rack_object = object_key
+        workflow.picked_rack_objects_by_hand.clear()
+        workflow.pick_hand_side = restored_hand_side
+        workflow.pick_hold_start_frame = attach_frame
+        workflow.pick_hold_start_frames_by_side.clear()
+        workflow.pick_object_hand_offset = (
+            hand_rotation_attach.T @ (np.asarray(object_position, dtype=np.float64) - palm_attach)
+        )
+        workflow.pick_object_hand_offsets_by_side.clear()
+        workflow.pick_reach_start_frame = 0
+        workflow.pick_hand_target_world = None
+        workflow.pick_target_path_world = None
+        workflow.pick_grasp_target_world = None
+        workflow.pick_grasp_verified = True
+        workflow.pick_elbow_bend_hint_world = None
+        workflow.place_release_frame = None
+        workflow.place_object_position_world = None
+        workflow.place_object_positions_by_hand.clear()
+        workflow.place_reach_start_frame = None
+        workflow.place_hand_target_world = None
+        workflow.place_hand_targets_by_side.clear()
+        workflow.place_target_path_world = None
+        workflow.place_target_paths_by_side.clear()
+        workflow.place_elbow_bend_hint_world = None
+        workflow.place_elbow_bend_hints_by_side.clear()
+        session.human_outbound_rack_poses[pick_request.rack_name] = (
+            motion.joints_pos[0].detach().cpu().numpy().copy(),
+            motion.joints_rot[0].detach().cpu().numpy().copy(),
+        )
+        session.human_route_rack = pick_request.rack_name
+        session.human_route_kind = "pick_hold"
+        self.set_frame(client.client_id, session.frame_idx)
 
     def generate(
         self,
@@ -2532,6 +3374,31 @@ class RobotDemo(Demo):
         model_pick_target_hand_rotations: np.ndarray | None = None
         model_pick_target_palm_normals: np.ndarray | None = None
         model_pick_palm_normal_local: np.ndarray | None = None
+        model_pick_hand_side: str = "right"
+        model_dual_pick_specs: dict[str, dict[str, object]] | None = None
+        model_pick_existing_objects_by_hand: dict[str, tuple[str, int, int]] = {}
+        model_pick_existing_offsets_by_hand: dict[str, np.ndarray] = {}
+        model_return_hold_rotations: np.ndarray | None = None
+        model_return_picked_object: tuple[str, int, int] | None = None
+        model_return_hand_offset: np.ndarray | None = None
+        model_return_hand_side: str = "right"
+        model_return_picked_objects_by_hand: dict[str, tuple[str, int, int]] | None = None
+        model_return_hand_offsets_by_side: dict[str, np.ndarray] | None = None
+        model_place_base_pose: tuple[np.ndarray, np.ndarray] | None = None
+        model_place_release_frame: int | None = None
+        model_place_target_hand_rotations: np.ndarray | None = None
+        model_place_hand_side: str = "right"
+        model_place_specs: dict[str, dict[str, object]] | None = None
+        rack_transfer_route: RackTransferRoute | None = None
+        requested_rack_transfer: RackTransferRequest | None = None
+        model_transfer_hold_rotations: np.ndarray | None = None
+        model_transfer_picked_object: tuple[str, int, int] | None = None
+        model_transfer_hand_offset: np.ndarray | None = None
+        model_transfer_hand_side: str = "right"
+        model_transfer_picked_objects_by_hand: dict[str, tuple[str, int, int]] | None = None
+        model_transfer_hand_offsets_by_side: dict[str, np.ndarray] | None = None
+        requested_rack_transfer_holding_pick = False
+        requested_human_return_holding_pick = False
 
         def strengthen_neutral_walk_guidance() -> None:
             nonlocal cfg_weight
@@ -2827,22 +3694,76 @@ class RobotDemo(Demo):
             self.set_frame(client.client_id, 0)
             return
 
-        requested_human_pick = requested_rack_pick(prompts)
+        requested_rack_transfer = _requested_rack_transfer(prompts)
+        requested_dual_pick = (
+            None if requested_rack_transfer is not None else _requested_dual_rack_pick(prompts)
+        )
+        requested_human_pick = (
+            None
+            if requested_rack_transfer is not None or requested_dual_pick is not None
+            else requested_rack_pick(prompts)
+        )
+        requested_human_place = (
+            False
+            if requested_dual_pick is not None or requested_human_pick is not None
+            else _requested_counter_place(prompts)
+        )
         requested_human_return = (
-            None if requested_human_pick is not None else requested_human_return_rack_name(prompts)
+            None
+            if requested_rack_transfer is not None or requested_dual_pick is not None or requested_human_pick is not None or requested_human_place
+            else requested_human_return_rack_name(prompts)
         )
         requested_rack = (
             None
-            if requested_human_pick is not None or requested_human_return is not None
+            if (
+                requested_rack_transfer is not None
+                or requested_dual_pick is not None
+                or requested_human_pick is not None
+                or requested_human_place
+                or requested_human_return is not None
+            )
             else requested_rack_name(prompts)
         )
-        if requested_human_pick is not None:
+        if requested_dual_pick is not None or requested_human_pick is not None:
             session = self.client_sessions[client.client_id]
-            pick_rack = requested_human_pick.rack_name
-            object_index = requested_human_pick.object_index
+            is_dual_pick = requested_dual_pick is not None
+            pick_rack = requested_dual_pick.rack_name if is_dual_pick else requested_human_pick.rack_name
+            shelf_number = requested_dual_pick.shelf_number if is_dual_pick else requested_human_pick.shelf_number
+            pick_object_indices = requested_dual_pick.object_indices if is_dual_pick else (requested_human_pick.object_index,)
             if pick_rack not in RACK_MAP_POSITIONS:
                 raise ValueError(f"Unknown warehouse rack {pick_rack.replace('_', ' ')}")
+            x_near = WORK_AREA_SIDE_SHIFT_M
+            x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
+            z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
+            rack_target, rack_facing_heading = rack_width_side_approach_pose(
+                RACK_MAP_POSITIONS[pick_rack],
+                RACK_MAP_YAWS_RAD.get(pick_rack, 0.0),
+                RACK_WIDTH_M,
+                RACK_HUMAN_APPROACH_CLEARANCE_M,
+                (x_far, x_near),
+                (z_far, 0.0),
+            )
             cached_outbound_pose = session.human_outbound_rack_poses.get(pick_rack)
+            if (
+                workflow is not None
+                and workflow.pick_grasp_verified
+                and session.human_route_rack == pick_rack
+                and session.human_route_kind == "pick_hold"
+                and session.motions
+            ):
+                current_motion = next(iter(session.motions.values()))
+                current_root = (
+                    current_motion.joints_pos[-1, current_motion.skeleton.root_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                if float(np.linalg.norm(current_root[[0, 2]] - np.asarray(rack_target)[[0, 2]])) <= 0.35:
+                    cached_outbound_pose = (
+                        current_motion.joints_pos[-1].detach().cpu().numpy().copy(),
+                        current_motion.joints_rot[-1].detach().cpu().numpy().copy(),
+                    )
             if (
                 cached_outbound_pose is None
                 and session.human_route_rack == pick_rack
@@ -2855,6 +3776,23 @@ class RobotDemo(Demo):
                     outbound_motion.joints_rot[-1].detach().cpu().numpy().copy(),
                 )
                 session.human_outbound_rack_poses[pick_rack] = cached_outbound_pose
+            if cached_outbound_pose is None and session.motions:
+                current_motion = next(iter(session.motions.values()))
+                current_root = (
+                    current_motion.joints_pos[-1, current_motion.skeleton.root_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                if float(np.linalg.norm(current_root[[0, 2]] - np.asarray(rack_target)[[0, 2]])) <= 0.35:
+                    cached_outbound_pose = (
+                        current_motion.joints_pos[-1].detach().cpu().numpy().copy(),
+                        current_motion.joints_rot[-1].detach().cpu().numpy().copy(),
+                    )
+                    session.human_outbound_rack_poses[pick_rack] = cached_outbound_pose
+                    session.human_route_rack = pick_rack
+                    session.human_route_kind = "outbound"
             if cached_outbound_pose is None:
                 raise RuntimeError(
                     f"Generate `move to {pick_rack.replace('_', ' ')}` before picking its object."
@@ -2865,22 +3803,16 @@ class RobotDemo(Demo):
                 raise RuntimeError("The outbound human motion is not available for pick initialization.")
             if workflow is None:
                 raise RuntimeError("The robot workflow state is unavailable.")
-            object_key = (pick_rack, object_index)
-            object_world_position = workflow.rack_object_home_positions.get(object_key)
-            if object_world_position is None:
-                raise RuntimeError(f"Shelf object {object_index} on {pick_rack} is unavailable.")
+            pick_object_positions: dict[int, np.ndarray] = {}
+            for object_index in pick_object_indices:
+                object_key = (pick_rack, shelf_number, object_index)
+                object_world_position = workflow.rack_object_home_positions.get(object_key)
+                if object_world_position is None:
+                    raise RuntimeError(
+                        f"Shelf {shelf_number} object {object_index} on {pick_rack} is unavailable."
+                    )
+                pick_object_positions[object_index] = np.asarray(object_world_position, dtype=np.float64)
 
-            x_near = WORK_AREA_SIDE_SHIFT_M
-            x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
-            z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
-            rack_target, rack_facing_heading = rack_width_side_approach_pose(
-                RACK_MAP_POSITIONS[pick_rack],
-                RACK_MAP_YAWS_RAD.get(pick_rack, 0.0),
-                RACK_WIDTH_M,
-                RACK_HUMAN_APPROACH_CLEARANCE_M,
-                (x_far, x_near),
-                (z_far, 0.0),
-            )
             total_frames = int(num_frames[0])
             last_positions_world, last_rotations = cached_outbound_pose
             last_positions_world = np.asarray(last_positions_world, dtype=np.float64).copy()
@@ -2920,40 +3852,24 @@ class RobotDemo(Demo):
             )
 
             reach_start_frame = 0
-            pregrasp_frame = max(1, int(round(total_frames * 0.38)))
-            grasp_frame = max(pregrasp_frame + 1, int(round(total_frames * 0.52)))
-            lift_frame = max(grasp_frame + 1, int(round(total_frames * 0.64)))
-            chest_frame = max(lift_frame + 1, int(round(total_frames * 0.84)))
-            chest_frame = min(chest_frame, total_frames - 1)
             hand_positions = np.repeat(last_positions_world[None, ...], total_frames, axis=0)
             hand_rotations = np.repeat(last_rotations[None, ...], total_frames, axis=0)
-            right_hand_names = session.skeleton.right_hand_joint_names
-            right_hand_indices = [
-                session.skeleton.bone_order_names.index(name) for name in right_hand_names
-            ]
-            hand_root_index = right_hand_indices[0]
-            middle_name = (
-                "RightHandMiddleEnd"
-                if "RightHandMiddleEnd" in session.skeleton.bone_order_names
-                else right_hand_names[-1]
+            last_frame = total_frames - 1
+            pregrasp_frame = max(1, int(round(last_frame * 0.38)))
+            grasp_frame = max(pregrasp_frame + 1, int(round(last_frame * 0.52)))
+            approach_frame = max(
+                pregrasp_frame + 1,
+                int(round((pregrasp_frame + grasp_frame) * 0.5)),
             )
-            thumb_name = (
-                "RightHandThumbEnd"
-                if "RightHandThumbEnd" in session.skeleton.bone_order_names
-                else None
-            )
-            middle_index = session.skeleton.bone_order_names.index(middle_name)
-            thumb_index = (
-                session.skeleton.bone_order_names.index(thumb_name)
-                if thumb_name is not None
-                else None
-            )
+            approach_frame = min(approach_frame, grasp_frame - 1)
+            lift_frame = max(grasp_frame + 1, int(round(last_frame * 0.64)))
+            chest_frame = max(lift_frame + 1, int(round(last_frame * 0.84)))
+            chest_frame = min(chest_frame, last_frame)
             rack_yaw = RACK_MAP_YAWS_RAD.get(pick_rack, 0.0)
             outward_normal = np.asarray(
                 [np.cos(rack_yaw), 0.0, -np.sin(rack_yaw)],
                 dtype=np.float64,
             )
-            object_position = np.asarray(object_world_position, dtype=np.float64)
             chest_index = session.skeleton.bone_order_names.index("Chest")
             right_shoulder_index = session.skeleton.bone_order_names.index("RightShoulder")
             left_shoulder_index = session.skeleton.bone_order_names.index("LeftShoulder")
@@ -2964,86 +3880,192 @@ class RobotDemo(Demo):
             right_lateral[1] = 0.0
             right_lateral /= max(float(np.linalg.norm(right_lateral)), 1e-9)
             # Direct pick path:
-            #   current hand -> right-side diagonal pregrasp -> grasp -> 5 cm lift -> chest hold.
+            #   current hand -> same-side diagonal pregrasp -> grasp -> 5 cm lift -> chest hold.
             # The pregrasp is offset 7 cm forward from the grasp point, 12 cm
-            # toward the human's right side, and 5 cm higher for shelf/rack
-            # clearance. This lets the right hand approach like an open gripper
+            # toward the active hand side, and 5 cm higher for shelf/rack
+            # clearance. This lets the hand approach like an open gripper
             # coming from the side, instead of pushing the item from the front.
-            grasp_target = object_position + 0.11 * outward_normal + np.array([0.0, -0.025, 0.0])
-            pregrasp_target = (
-                grasp_target
-                + 0.07 * outward_normal
-                + 0.12 * right_lateral
-                + np.array([0.0, 0.05, 0.0])
+            approach_clearance = 0.11
+            pregrasp_clearance = 0.07
+            lateral_clearance = 0.12
+            pick_sides_and_objects = (
+                (("right", 1), ("left", 3))
+                if is_dual_pick
+                else (("left" if pick_object_indices[0] == 3 else "right", pick_object_indices[0]),)
             )
-            lift_target = grasp_target + np.array([0.0, 0.05, 0.0])
-            chest_target = (
-                last_positions_world[chest_index]
-                - 0.24 * outward_normal
-                + 0.18 * right_lateral
-                + np.array([0.0, -0.10, 0.0])
-            )
-            hand_target_path = _smooth_waypoint_path(
-                total_frames,
-                [
-                    (0, last_positions_world[hand_root_index]),
-                    (pregrasp_frame, pregrasp_target),
-                    (grasp_frame, grasp_target),
-                    (lift_frame, lift_target),
-                    (chest_frame, chest_target),
-                    (total_frames - 1, chest_target),
-                ],
-            )
-            base_finger_direction = (
-                last_positions_world[middle_index] - last_positions_world[hand_root_index]
-            )
-            if thumb_index is not None:
-                base_thumb_direction = (
-                    last_positions_world[thumb_index] - last_positions_world[hand_root_index]
+            pick_specs: dict[str, dict[str, object]] = {}
+            for pick_hand_side, object_index in pick_sides_and_objects:
+                hand_label = "Left" if pick_hand_side == "left" else "Right"
+                active_hand_names = (
+                    session.skeleton.left_hand_joint_names
+                    if pick_hand_side == "left"
+                    else session.skeleton.right_hand_joint_names
                 )
-                base_palm_normal_world = np.cross(base_thumb_direction, base_finger_direction)
-            else:
-                base_palm_normal_world = last_rotations[hand_root_index][:, 1]
-            if float(np.linalg.norm(base_palm_normal_world)) < 1e-6:
-                base_palm_normal_world = last_rotations[hand_root_index][:, 1]
-            base_palm_normal_world /= max(float(np.linalg.norm(base_palm_normal_world)), 1e-9)
-            if float(np.dot(base_palm_normal_world, np.array([0.0, 1.0, 0.0]))) < 0.0:
-                base_palm_normal_world = -base_palm_normal_world
-            model_pick_palm_normal_local = (
-                last_rotations[hand_root_index].T @ base_palm_normal_world
-            )
-            target_palm_normals = _smooth_waypoint_path(
-                total_frames,
-                [
-                    (0, base_palm_normal_world),
-                    (pregrasp_frame, np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                    (grasp_frame, np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                    (lift_frame, np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                    (chest_frame, np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                    (total_frames - 1, np.array([0.0, 1.0, 0.0], dtype=np.float64)),
-                ],
-            )
-            target_palm_norms = np.linalg.norm(target_palm_normals, axis=1, keepdims=True)
-            model_pick_target_palm_normals = target_palm_normals / np.maximum(target_palm_norms, 1e-9)
+                active_hand_indices = [
+                    session.skeleton.bone_order_names.index(name) for name in active_hand_names
+                ]
+                hand_root_index = active_hand_indices[0]
+                middle_name = (
+                    f"{hand_label}HandMiddleEnd"
+                    if f"{hand_label}HandMiddleEnd" in session.skeleton.bone_order_names
+                    else active_hand_names[-1]
+                )
+                thumb_name = (
+                    f"{hand_label}HandThumbEnd"
+                    if f"{hand_label}HandThumbEnd" in session.skeleton.bone_order_names
+                    else None
+                )
+                middle_index = session.skeleton.bone_order_names.index(middle_name)
+                thumb_index = (
+                    session.skeleton.bone_order_names.index(thumb_name)
+                    if thumb_name is not None
+                    else None
+                )
+                active_lateral = right_lateral if pick_hand_side == "right" else -right_lateral
+                object_position = pick_object_positions[object_index]
+                grasp_target = object_position + approach_clearance * outward_normal + np.array([0.0, -0.025, 0.0])
+                pregrasp_target = (
+                    grasp_target
+                    + pregrasp_clearance * outward_normal
+                    + lateral_clearance * active_lateral
+                    + np.array([0.0, 0.05, 0.0])
+                )
+                diagonal_approach_target = (
+                    grasp_target
+                    + 0.5 * pregrasp_clearance * outward_normal
+                    + 0.5 * lateral_clearance * active_lateral
+                    + np.array([0.0, 0.025, 0.0])
+                )
+                lift_target = grasp_target + np.array([0.0, 0.05, 0.0])
+                chest_target = (
+                    last_positions_world[chest_index]
+                    - 0.24 * outward_normal
+                    + 0.18 * active_lateral
+                    + np.array([0.0, -0.10, 0.0])
+                )
+                hand_target_path = _smooth_waypoint_path(
+                    total_frames,
+                    [
+                        (0, last_positions_world[hand_root_index]),
+                        (pregrasp_frame, pregrasp_target),
+                        (approach_frame, diagonal_approach_target),
+                        (grasp_frame, grasp_target),
+                        (lift_frame, lift_target),
+                        (chest_frame, chest_target),
+                        (total_frames - 1, chest_target),
+                    ],
+                )
+                base_finger_direction = (
+                    last_positions_world[middle_index] - last_positions_world[hand_root_index]
+                )
+                if thumb_index is not None:
+                    base_thumb_direction = (
+                        last_positions_world[thumb_index] - last_positions_world[hand_root_index]
+                    )
+                    base_palm_normal_world = (
+                        np.cross(base_finger_direction, base_thumb_direction)
+                        if pick_hand_side == "left"
+                        else np.cross(base_thumb_direction, base_finger_direction)
+                    )
+                else:
+                    base_palm_normal_world = last_rotations[hand_root_index][:, 1]
+                if float(np.linalg.norm(base_palm_normal_world)) < 1e-6:
+                    base_palm_normal_world = last_rotations[hand_root_index][:, 1]
+                base_palm_normal_world /= max(float(np.linalg.norm(base_palm_normal_world)), 1e-9)
+                if float(np.dot(base_palm_normal_world, np.array([0.0, 1.0, 0.0]))) < 0.0:
+                    base_palm_normal_world = -base_palm_normal_world
+                desired_palm_normal_world = np.array(
+                    [0.0, -1.0 if pick_hand_side == "left" else 1.0, 0.0],
+                    dtype=np.float64,
+                )
+                target_palm_normals = _smooth_waypoint_path(
+                    total_frames,
+                    [
+                        (0, base_palm_normal_world),
+                        (pregrasp_frame, desired_palm_normal_world),
+                        (approach_frame, desired_palm_normal_world),
+                        (grasp_frame, desired_palm_normal_world),
+                        (lift_frame, desired_palm_normal_world),
+                        (chest_frame, desired_palm_normal_world),
+                        (total_frames - 1, desired_palm_normal_world),
+                    ],
+                )
+                target_palm_norms = np.linalg.norm(target_palm_normals, axis=1, keepdims=True)
+                target_palm_normals = target_palm_normals / np.maximum(target_palm_norms, 1e-9)
+                rack_center = np.asarray(RACK_MAP_POSITIONS[pick_rack], dtype=np.float64)
+                front_clearance = (hand_target_path - rack_center[None, :]) @ outward_normal
+                minimum_front_clearance = float(RACK_WIDTH_M / 2.0 + 0.045)
+                actual_front_clearance = float(front_clearance.min())
+                if actual_front_clearance < minimum_front_clearance:
+                    raise RuntimeError(
+                        "The planned hand path does not clear the shelf front by 4.5 cm "
+                        f"(needed {minimum_front_clearance:.3f} m from rack center, "
+                        f"got {actual_front_clearance:.3f} m)."
+                    )
+                for frame in range(total_frames):
+                    hand_positions[frame, active_hand_indices] += (
+                        hand_target_path[frame] - last_positions_world[hand_root_index]
+                    )
+                pick_specs[pick_hand_side] = {
+                    "object_index": object_index,
+                    "object_key": (pick_rack, shelf_number, object_index),
+                    "hand_target_path": hand_target_path,
+                    "hand_target_world": chest_target,
+                    "grasp_target_world": grasp_target,
+                    "palm_normal_local": last_rotations[hand_root_index].T @ base_palm_normal_world,
+                    "target_palm_normals": target_palm_normals,
+                    "elbow_bend_hint": active_lateral + np.array([0.0, -0.35, 0.0]),
+                    "hand_root_index": hand_root_index,
+                    "hand_start_position": last_positions_world[hand_root_index],
+                    "middle_index": middle_index,
+                    "object_position": object_position,
+                    "pregrasp_target": pregrasp_target,
+                    "diagonal_approach_target": diagonal_approach_target,
+                    "lift_target": lift_target,
+                    "chest_target": chest_target,
+                    "active_lateral": active_lateral,
+                    "correction_start_frame": pregrasp_frame,
+                }
+            primary_side = "right" if "right" in pick_specs else next(iter(pick_specs))
+            primary_spec = pick_specs[primary_side]
+            object_index = int(primary_spec["object_index"])
+            object_key = primary_spec["object_key"]
+            object_position = primary_spec["object_position"]
+            hand_target_path = primary_spec["hand_target_path"]
+            grasp_target = primary_spec["grasp_target_world"]
+            pregrasp_target = primary_spec["pregrasp_target"]
+            lift_target = primary_spec["lift_target"]
+            chest_target = primary_spec["chest_target"]
+            model_pick_hand_side = primary_side
+            model_pick_palm_normal_local = primary_spec["palm_normal_local"]
+            model_pick_target_palm_normals = primary_spec["target_palm_normals"]
             model_pick_target_hand_rotations = None
+            model_dual_pick_specs = pick_specs if is_dual_pick else None
+            if not is_dual_pick and workflow.pick_grasp_verified:
+                model_pick_existing_objects_by_hand = dict(workflow.picked_rack_objects_by_hand)
+                model_pick_existing_offsets_by_hand = {
+                    side: np.asarray(offset, dtype=np.float64).copy()
+                    for side, offset in workflow.pick_object_hand_offsets_by_side.items()
+                }
+                if (
+                    workflow.picked_rack_object is not None
+                    and workflow.pick_object_hand_offset is not None
+                ):
+                    model_pick_existing_objects_by_hand.setdefault(
+                        workflow.pick_hand_side,
+                        workflow.picked_rack_object,
+                    )
+                    model_pick_existing_offsets_by_hand.setdefault(
+                        workflow.pick_hand_side,
+                        np.asarray(workflow.pick_object_hand_offset, dtype=np.float64).copy(),
+                    )
+                model_pick_existing_objects_by_hand.pop(primary_side, None)
+                model_pick_existing_offsets_by_hand.pop(primary_side, None)
             rack_center = np.asarray(RACK_MAP_POSITIONS[pick_rack], dtype=np.float64)
-            front_clearance = (hand_target_path - rack_center[None, :]) @ outward_normal
-            minimum_front_clearance = float(RACK_WIDTH_M / 2.0 + 0.045)
-            actual_front_clearance = float(front_clearance.min())
-            if actual_front_clearance < minimum_front_clearance:
-                raise RuntimeError(
-                    "The planned hand path does not clear the shelf front by 4.5 cm "
-                    f"(needed {minimum_front_clearance:.3f} m from rack center, "
-                    f"got {actual_front_clearance:.3f} m)."
-                )
-            for frame in range(total_frames):
-                hand_positions[frame, right_hand_indices] += (
-                    hand_target_path[frame] - last_positions_world[hand_root_index]
-                )
             pick_constraint_debug_path = _save_pick_constraint_debug_json(
                 rack_name=pick_rack,
                 object_index=object_index,
-                shelf_number=requested_human_pick.shelf_number,
+                shelf_number=shelf_number,
                 total_frames=total_frames,
                 fps=float(session.model_fps),
                 rack_target=np.asarray(rack_target, dtype=np.float64),
@@ -3060,7 +4082,8 @@ class RobotDemo(Demo):
                 chest_target=chest_target,
                 root_path=stationary_root,
                 right_hand_path=hand_target_path,
-                right_hand_start_position=last_positions_world[hand_root_index],
+                right_hand_start_position=last_positions_world[int(primary_spec["hand_root_index"])],
+                hand_specs=pick_specs,
             )
             end_effector_constraint.add_interval(
                 f"auto_{pick_rack}_object_{object_index}_pick_limbs",
@@ -3084,26 +4107,68 @@ class RobotDemo(Demo):
             for key, handle in workflow.rack_object_handles.items():
                 home = workflow.rack_object_home_positions[key]
                 handle.position = home
-            workflow.picked_rack_object = object_key
+            if is_dual_pick:
+                workflow.picked_rack_object = None
+                workflow.picked_rack_objects_by_hand = {
+                    side: spec["object_key"] for side, spec in pick_specs.items()
+                }
+                workflow.pick_hold_start_frames_by_side = {
+                    side: grasp_frame for side in pick_specs
+                }
+            else:
+                workflow.picked_rack_object = object_key
+                workflow.picked_rack_objects_by_hand = dict(model_pick_existing_objects_by_hand)
+                workflow.pick_hold_start_frames_by_side = {
+                    side: 0 for side in model_pick_existing_objects_by_hand
+                }
+            workflow.pick_hand_side = primary_side
             workflow.pick_hold_start_frame = grasp_frame
             workflow.pick_object_hand_offset = None
+            workflow.pick_object_hand_offsets_by_side = {
+                side: offset.copy()
+                for side, offset in model_pick_existing_offsets_by_hand.items()
+            }
             workflow.pick_reach_start_frame = reach_start_frame
             workflow.pick_hand_target_world = chest_target
             workflow.pick_target_path_world = hand_target_path
             workflow.pick_grasp_target_world = grasp_target
             workflow.pick_grasp_verified = False
-            workflow.pick_elbow_bend_hint_world = right_lateral + np.array([0.0, -0.35, 0.0])
-            prompts = [
-                "An ordinary healthy person stands still, upright, and balanced. They clearly "
-                "move only the right arm directly toward the selected object, stop at a close "
-                "pregrasp pose with the wrist straight in line with the forearm and the palm facing downward "
-                "to support the object, grasp the object with the right hand, lift it vertically by 5 cm "
-                "while keeping the wrist straight, "
-                f"then bring it to a holding pose in front of the chest. The hand must not wander "
-                f"away from the object or touch the rack or shelf; it touches only the selected "
-                f"object on shelf 4 of {pick_rack.replace('_', ' ')}. The left arm, body, and feet "
-                "remain still."
-            ]
+            workflow.pick_elbow_bend_hint_world = primary_spec["elbow_bend_hint"]
+            workflow.place_release_frame = None
+            workflow.place_object_position_world = None
+            workflow.place_object_positions_by_hand.clear()
+            workflow.place_reach_start_frame = None
+            workflow.place_hand_target_world = None
+            workflow.place_hand_targets_by_side.clear()
+            workflow.place_target_path_world = None
+            workflow.place_target_paths_by_side.clear()
+            workflow.place_elbow_bend_hint_world = None
+            workflow.place_elbow_bend_hints_by_side.clear()
+            if is_dual_pick:
+                pick_prompt_text = (
+                    "An ordinary healthy person stands still, upright, and balanced. They clearly "
+                    "first move both arms to close pregrasp poses for objects 1 and 3 at the same time, with the right hand "
+                    "aligned to object 1 and the left hand aligned to object 3. From the pregrasp poses, both hands approach "
+                    "the objects diagonally from the side, then grasp both objects, lift them vertically by 5 cm while keeping "
+                    "the wrists straight, then bring both objects to mirrored holding poses in front of the chest. The hands "
+                    "must not wander away from the objects or touch the "
+                    "rack or shelf; each hand touches only its selected object. The body and feet remain still. If the "
+                    "clip has extra time, finish the pick and stay frozen in the final holding pose without extra hand "
+                    "or body movement."
+                )
+            else:
+                pick_prompt_text = (
+                    "An ordinary healthy person stands still, upright, and balanced. They clearly "
+                    f"first move only the {primary_side} arm to a close pregrasp pose for the selected object. From the "
+                    "pregrasp pose, the hand approaches the object diagonally from the side with the wrist straight in line "
+                    f"with the forearm and the palm naturally aligned to support the object, grasps the object with the {primary_side} hand, "
+                    "lifts it vertically by 5 cm while keeping the wrist straight, then brings it to a holding pose in front of the chest. The hand "
+                    "must not wander away from the object or touch the rack or shelf; it touches only the selected "
+                    f"object on shelf {shelf_number} of {pick_rack.replace('_', ' ')}. The body and feet remain still. "
+                    "If the clip has extra time, finish the pick and stay frozen in the final holding pose without "
+                    "extra hand or body movement."
+                )
+            prompts = [pick_prompt_text]
             strengthen_neutral_walk_guidance()
             cfg_weight = list(cfg_weight or [3.5, 3.0])
             if len(cfg_weight) > 1:
@@ -3115,10 +4180,14 @@ class RobotDemo(Demo):
                 0.02,
             )
             client.add_notification(
-                title=f"{pick_rack.replace('_', ' ').title()} Shelf 4 pick applied",
+                title=f"{pick_rack.replace('_', ' ').title()} Shelf {shelf_number} pick applied",
                 body=(
-                    f"Right hand approaches above the shelf, grasps object {object_index} at frame "
-                    f"{grasp_frame}, lifts it, and holds it at chest level.\n\n"
+                    (
+                        f"Right hand grasps object 1 and left hand grasps object 3 at frame "
+                        if is_dual_pick
+                        else f"{primary_side.title()} hand approaches above the shelf, grasps object {object_index} at frame "
+                    )
+                    + f"{grasp_frame}, lifts it, and holds it at chest level.\n\n"
                     f"Saved constraint debug JSON:\n{pick_constraint_debug_path}"
                 ),
                 auto_close_seconds=7.0,
@@ -3127,15 +4196,6 @@ class RobotDemo(Demo):
             self._apply_constraint_overlay_visibility(session)
         elif requested_human_return is not None:
             session = self.client_sessions[client.client_id]
-            if session.human_route_rack != requested_human_return or session.human_route_kind != "outbound":
-                raise RuntimeError(
-                    f"Generate the outbound human motion to {requested_human_return.replace('_', ' ')} first."
-                )
-            if len(num_frames) != 1 or num_frames[0] < 2:
-                raise ValueError("A human return prompt must contain one motion segment.")
-            root_constraint = session.constraints.get("2D Root")
-            if root_constraint is None:
-                raise RuntimeError("The active Kimodo model does not provide a 2D Root constraint track.")
             x_near = WORK_AREA_SIDE_SHIFT_M
             x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
             z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
@@ -3147,12 +4207,134 @@ class RobotDemo(Demo):
                 (x_far, x_near),
                 (z_far, 0.0),
             )
-            human_reverse_distance = 0.10 if requested_human_return == "rack_4" else 0.0
+            if session.human_route_rack != requested_human_return or session.human_route_kind not in {
+                "outbound",
+                "pick_hold",
+            }:
+                if (
+                    workflow is not None
+                    and (
+                        (
+                            workflow.picked_rack_object is not None
+                            and workflow.picked_rack_object[0] == requested_human_return
+                            and workflow.pick_object_hand_offset is not None
+                        )
+                        or (
+                            workflow.picked_rack_objects_by_hand
+                            and all(
+                                object_key[0] == requested_human_return
+                                for object_key in workflow.picked_rack_objects_by_hand.values()
+                            )
+                            and workflow.pick_object_hand_offsets_by_side
+                        )
+                    )
+                    and workflow.pick_grasp_verified
+                ):
+                    session.human_route_rack = requested_human_return
+                    session.human_route_kind = "pick_hold"
+                elif session.motions:
+                    current_motion = next(iter(session.motions.values()))
+                    current_root = (
+                        current_motion.joints_pos[-1, current_motion.skeleton.root_idx]
+                        .detach()
+                        .cpu()
+                        .numpy()
+                        .astype(np.float64)
+                    )
+                    if float(np.linalg.norm(current_root[[0, 2]] - np.asarray(rack_target)[[0, 2]])) <= 0.45:
+                        session.human_route_rack = requested_human_return
+                        session.human_route_kind = "outbound"
+            if session.human_route_rack != requested_human_return or session.human_route_kind not in {
+                "outbound",
+                "pick_hold",
+            }:
+                raise RuntimeError(
+                    f"Generate the outbound human motion to {requested_human_return.replace('_', ' ')} first, "
+                    "or pick an item there before returning."
+                )
+            requested_human_return_holding_pick = session.human_route_kind == "pick_hold"
+            if requested_human_return_holding_pick:
+                if workflow is None:
+                    raise RuntimeError("The robot workflow state is unavailable.")
+                has_single_hold = (
+                    workflow.picked_rack_object is not None
+                    and workflow.pick_object_hand_offset is not None
+                )
+                has_dual_hold = (
+                    bool(workflow.picked_rack_objects_by_hand)
+                    and {"left", "right"} <= set(workflow.picked_rack_objects_by_hand)
+                    and {"left", "right"} <= set(workflow.pick_object_hand_offsets_by_side)
+                )
+                if (not has_single_hold and not has_dual_hold) or not workflow.pick_grasp_verified:
+                    raise RuntimeError("Pick an item successfully before generating a carry return.")
+                if not session.motions:
+                    raise RuntimeError("The pick-hold motion is not available for return initialization.")
+                pick_motion = next(iter(session.motions.values()))
+                model_return_hold_rotations = (
+                    pick_motion.joints_rot[-1].detach().cpu().numpy().copy()
+                )
+                if has_dual_hold:
+                    model_return_picked_object = None
+                    model_return_hand_offset = None
+                    model_return_picked_objects_by_hand = dict(workflow.picked_rack_objects_by_hand)
+                    model_return_hand_offsets_by_side = {
+                        side: np.asarray(offset, dtype=np.float64).copy()
+                        for side, offset in workflow.pick_object_hand_offsets_by_side.items()
+                    }
+                    model_return_hand_side = "both"
+                else:
+                    model_return_picked_object = workflow.picked_rack_object
+                    model_return_hand_offset = np.asarray(
+                        workflow.pick_object_hand_offset,
+                        dtype=np.float64,
+                    ).copy()
+                    model_return_picked_objects_by_hand = None
+                    model_return_hand_offsets_by_side = None
+                    model_return_hand_side = workflow.pick_hand_side
+            if len(num_frames) != 1 or num_frames[0] < 2:
+                raise ValueError("A human return prompt must contain one motion segment.")
+            root_constraint = session.constraints.get("2D Root")
+            fullbody_constraint = session.constraints.get("Full-Body")
+            end_effector_constraint = session.constraints.get("End-Effectors")
+            if root_constraint is None:
+                raise RuntimeError("The active Kimodo model does not provide a 2D Root constraint track.")
+            if fullbody_constraint is None or end_effector_constraint is None:
+                raise RuntimeError("The active Kimodo model does not provide all return constraint tracks.")
+            return_start_position = np.asarray(rack_target, dtype=np.float64)
+            return_initial_positions: np.ndarray | None = None
+            return_initial_rotations: np.ndarray | None = None
+            if session.motions:
+                source_motion = next(iter(session.motions.values()))
+                source_root = (
+                    source_motion.joints_pos[-1, session.skeleton.root_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                if (
+                    requested_human_return_holding_pick
+                    or float(np.linalg.norm(source_root[[0, 2]] - np.asarray(rack_target)[[0, 2]])) <= 0.45
+                ):
+                    return_start_position = source_root
+                    return_initial_positions = source_motion.joints_pos[-1].detach().cpu().numpy()
+                    return_initial_rotations = source_motion.joints_rot[-1].detach().cpu().numpy()
+            rack4_direct_counter_return = requested_human_return == "rack_4"
+            human_reverse_distance = (
+                0.12
+                if requested_human_return_holding_pick
+                else 0.0
+            )
+            human_reverse_seconds = (
+                1.00
+                if rack4_direct_counter_return and human_reverse_distance > 0.0
+                else 0.50
+            )
             heading_vector = (np.sin(rack_facing_heading), np.cos(rack_facing_heading))
             backed_position = (
-                rack_target[0] - human_reverse_distance * heading_vector[0],
+                return_start_position[0] - human_reverse_distance * heading_vector[0],
                 0.0,
-                rack_target[2] - human_reverse_distance * heading_vector[1],
+                return_start_position[2] - human_reverse_distance * heading_vector[1],
             )
             obstacles = []
             for rack_name, rack_center in RACK_MAP_POSITIONS.items():
@@ -3167,24 +4349,75 @@ class RobotDemo(Demo):
                 (z_far, 0.0),
                 obstacles,
             )
+            turn_seconds_per_90 = 0.90 if requested_human_return_holding_pick else 1.10
+            initial_hold_seconds = 0.50 if requested_human_return_holding_pick else 0.20
+            final_hold_seconds = 0.50 if requested_human_return_holding_pick else 0.75
+            return_walk_speed_m_s = (
+                _rack_human_walk_speed_m_s(requested_human_return)
+                if requested_human_return_holding_pick
+                else 0.60
+                if requested_human_return == "rack_1"
+                else 0.90
+            )
+            return_first_axis = "z" if rack4_direct_counter_return else "x"
+            return_target_position = (
+                (float(return_start_position[0]), 0.0, 0.0)
+                if rack4_direct_counter_return
+                else (0.0, 0.0, 0.0)
+            )
+            turn_sign = 1.0 if safer_side == "left" else -1.0
+            current_heading = (
+                rack_facing_heading + turn_sign * np.pi + np.pi
+            ) % (2.0 * np.pi) - np.pi
+            extra_turn_seconds = 0.0
+            current_x = float(backed_position[0])
+            current_z = float(backed_position[2])
+            target_x = float(return_target_position[0])
+            target_z = float(return_target_position[2])
+            for axis in ((0, 2) if return_first_axis == "x" else (2, 0)):
+                if axis == 0:
+                    if np.isclose(current_x, target_x):
+                        continue
+                    desired_heading = np.pi / 2.0 if target_x > current_x else -np.pi / 2.0
+                    current_x = target_x
+                else:
+                    if np.isclose(current_z, target_z):
+                        continue
+                    desired_heading = 0.0 if target_z > current_z else np.pi
+                    current_z = target_z
+                turn_delta = (desired_heading - current_heading + np.pi) % (2.0 * np.pi) - np.pi
+                extra_turn_seconds += turn_seconds_per_90 * abs(turn_delta) / (np.pi / 2.0)
+                current_heading = desired_heading
+            reverse_seconds = human_reverse_seconds if human_reverse_distance > 0.0 else 0.0
             minimum_duration_s = (
-                2.50 + (abs(backed_position[0]) + abs(backed_position[2])) / 0.80
+                initial_hold_seconds
+                + reverse_seconds
+                + 2.0 * turn_seconds_per_90
+                + extra_turn_seconds
+                + (
+                    abs(backed_position[0] - target_x)
+                    + abs(backed_position[2] - target_z)
+                )
+                / return_walk_speed_m_s
+                + final_hold_seconds
             )
             requested_duration_s = int(num_frames[0]) / float(session.model_fps)
             if requested_duration_s < minimum_duration_s:
-                raise ValueError(
-                    f"Human return from {requested_human_return.replace('_', ' ')} needs at least "
-                    f"{np.ceil(minimum_duration_s):.0f} seconds for slow walking and safe turns."
-                )
-            return_walk_speed_m_s = 0.60 if requested_human_return == "rack_1" else 0.90
+                num_frames = [int(np.ceil(minimum_duration_s * float(session.model_fps)))]
             route = plan_cardinal_return_route(
-                start_position=rack_target,
+                start_position=return_start_position,
                 start_heading=rack_facing_heading,
                 turn_side=safer_side,
                 total_frames=int(num_frames[0]),
                 fps=float(session.model_fps),
                 reverse_distance=human_reverse_distance,
+                reverse_seconds=human_reverse_seconds,
+                turn_seconds_per_90=turn_seconds_per_90,
                 walk_speed_m_s=return_walk_speed_m_s,
+                initial_hold_seconds=initial_hold_seconds,
+                final_hold_seconds=final_hold_seconds,
+                first_axis=return_first_axis,
+                target_position=return_target_position,
             )
             if any(
                 not (x_far <= position[0] <= x_near and z_far <= position[2] <= 0.0)
@@ -3196,11 +4429,12 @@ class RobotDemo(Demo):
             session.constrained_root_initial_turn_angle = None
             session.constrained_root_turn_end_frame = None
             session.constrained_root_headings = list(route.headings)
-            session.generation_world_offset = tuple(float(value) for value in rack_target)
-            session.hide_constraint_overlays = False
+            session.generation_world_offset = None
+            session.hide_constraint_overlays = True
             session.human_route_rack = requested_human_return
-            session.human_route_kind = "return"
-            root_constraint.clear()
+            session.human_route_kind = "carry_return" if requested_human_return_holding_pick else "return"
+            for constraint in (root_constraint, fullbody_constraint, end_effector_constraint):
+                constraint.clear()
             root_constraint.set_smooth_path(False)
             root_constraint.add_interval(
                 f"auto_{requested_human_return}_human_return",
@@ -3209,7 +4443,40 @@ class RobotDemo(Demo):
                 np.asarray(route.positions, dtype=np.float64),
             )
             root_constraint.set_dense_path(True)
-            prompts = [rack_return_model_prompt(requested_human_return)]
+            if return_initial_positions is not None and return_initial_rotations is not None:
+                initial_pose_frames = min(
+                    max(5, int(round(initial_hold_seconds * float(session.model_fps)))),
+                    int(num_frames[0]),
+                )
+                fullbody_constraint.add_interval(
+                    f"auto_{requested_human_return}_return_start_pose",
+                    0,
+                    initial_pose_frames - 1,
+                    np.repeat(return_initial_positions[None, ...], initial_pose_frames, axis=0),
+                    np.repeat(return_initial_rotations[None, ...], initial_pose_frames, axis=0),
+                )
+            if requested_human_return_holding_pick:
+                if model_return_hand_side == "both":
+                    prompts = [
+                        "An ordinary healthy person carefully carries two small objects, one in each hand, "
+                        "held in mirrored positions in front of the chest. They stand upright and balanced, "
+                        "keep both arms steady relative to the torso without swinging either object, make "
+                        "controlled in-place turns with stable footwork, then walk at the same steady pace "
+                        "back to the counter/origin. At the end they stand still at the counter/origin while "
+                        "holding both objects in the same body-relative poses."
+                    ]
+                else:
+                    held_hand_side = workflow.pick_hand_side if workflow is not None else "right"
+                    other_hand_side = "left" if held_hand_side == "right" else "right"
+                    prompts = [
+                        f"An ordinary healthy person carefully carries a small object in the {held_hand_side} hand "
+                        f"in front of the chest. They stand upright and balanced, keep the {held_hand_side} arm steady "
+                        "relative to the torso without swinging it, make controlled in-place turns with stable "
+                        f"footwork, then walk at the same steady pace back to the counter/origin. The {other_hand_side} arm "
+                        "stays relaxed for balance, and at the end they stand still at the counter/origin."
+                    ]
+            else:
+                prompts = [rack_return_model_prompt(requested_human_return)]
             strengthen_neutral_walk_guidance()
             postprocess_parameters = dict(postprocess_parameters or {})
             postprocess_parameters["post_processing"] = True
@@ -3221,16 +4488,547 @@ class RobotDemo(Demo):
                 title=f"{requested_human_return.replace('_', ' ').title()} human return applied",
                 body=(
                     (
-                        "Reverse 0.10 m, "
+                        f"Reverse {human_reverse_distance:.2f} m over {human_reverse_seconds:.1f}s, "
                         if human_reverse_distance > 0.0
                         else ""
                     )
-                    + f"turn {safer_side} twice by 90 degrees, then walk slowly "
-                    f"along straight aisles to the origin at {return_walk_speed_m_s:.2f} m/s."
+                    + f"turn {safer_side} twice by 90 degrees, then walk "
+                    f"along straight aisles to the counter at {return_walk_speed_m_s:.2f} m/s."
+                    + (
+                        f" Duration extended to {int(num_frames[0]) / float(session.model_fps):.1f}s for stable turns."
+                        if requested_duration_s < minimum_duration_s
+                        else ""
+                    )
+                    + (
+                        (
+                            " Both picked items stay attached to both hands in the same body-relative hold poses."
+                            if model_return_hand_side == "both"
+                            else f" The picked item stays attached to the {model_return_hand_side} hand in the same body-relative hold pose."
+                        )
+                        if requested_human_return_holding_pick
+                        else ""
+                    )
                 ),
                 auto_close_seconds=7.0,
                 color="green",
             )
+            self._apply_constraint_overlay_visibility(session)
+        elif requested_human_place:
+            session = self.client_sessions[client.client_id]
+            if workflow is None:
+                raise RuntimeError("The robot workflow state is unavailable.")
+            has_single_place_hold = (
+                workflow.picked_rack_object is not None
+                and workflow.pick_object_hand_offset is not None
+            )
+            has_dual_place_hold = (
+                bool(workflow.picked_rack_objects_by_hand)
+                and {"left", "right"} <= set(workflow.picked_rack_objects_by_hand)
+                and {"left", "right"} <= set(workflow.pick_object_hand_offsets_by_side)
+            )
+            if (not has_single_place_hold and not has_dual_place_hold) or not workflow.pick_grasp_verified:
+                raise RuntimeError("Pick an item and carry it back to the counter before placing it.")
+            if session.human_route_kind != "carry_return":
+                raise RuntimeError("Generate the carry return to the counter before placing the object.")
+            if not session.motions:
+                raise RuntimeError("The carry-return motion is not available for place initialization.")
+            if len(num_frames) != 1:
+                raise ValueError("A counter-place motion needs one segment.")
+            total_frames = int(num_frames[0])
+            if total_frames < 2:
+                raise ValueError("A counter-place motion needs at least two frames.")
+            source_motion = next(iter(session.motions.values()))
+            last_positions_world = source_motion.joints_pos[-1].detach().cpu().numpy().copy()
+            last_rotations = source_motion.joints_rot[-1].detach().cpu().numpy().copy()
+            model_place_base_pose = (last_positions_world, last_rotations)
+
+            root_constraint = session.constraints.get("2D Root")
+            fullbody_constraint = session.constraints.get("Full-Body")
+            end_effector_constraint = session.constraints.get("End-Effectors")
+            if root_constraint is None or fullbody_constraint is None or end_effector_constraint is None:
+                raise RuntimeError("The active Kimodo model does not provide all place constraints.")
+            for constraint in (root_constraint, fullbody_constraint, end_effector_constraint):
+                constraint.clear()
+
+            root_index = session.skeleton.root_idx
+            stationary_root = np.repeat(
+                last_positions_world[root_index][None, :],
+                total_frames,
+                axis=0,
+            )
+            root_constraint.set_smooth_path(False)
+            root_constraint.add_interval(
+                "auto_counter_place_root",
+                0,
+                total_frames - 1,
+                stationary_root,
+            )
+            root_constraint.set_dense_path(True)
+
+            initial_pose_frames = min(5, total_frames)
+            fullbody_constraint.add_interval(
+                "auto_counter_place_start_pose",
+                0,
+                initial_pose_frames - 1,
+                np.repeat(last_positions_world[None, ...], initial_pose_frames, axis=0),
+                np.repeat(last_rotations[None, ...], initial_pose_frames, axis=0),
+            )
+
+            right_shoulder_index = session.skeleton.bone_order_names.index("RightShoulder")
+            left_shoulder_index = session.skeleton.bone_order_names.index("LeftShoulder")
+            right_lateral = last_positions_world[right_shoulder_index] - last_positions_world[left_shoulder_index]
+            right_lateral[1] = 0.0
+            right_lateral /= max(float(np.linalg.norm(right_lateral)), 1e-9)
+            tabletop_margin = RACK_PICK_OBJECT_SIZE_M / 2.0 + 0.02
+            table_x_min = -COUNTER_TABLE_LENGTH_M / 2.0 + tabletop_margin
+            table_x_max = COUNTER_TABLE_LENGTH_M / 2.0 - tabletop_margin
+            table_z_min = COUNTER_TABLE_DISTANCE_FROM_ORIGIN_M + tabletop_margin
+            table_z_max = (
+                COUNTER_TABLE_DISTANCE_FROM_ORIGIN_M
+                + COUNTER_TABLE_WIDTH_M
+                - tabletop_margin
+            )
+            reach_start_frame = 0
+            last_frame = total_frames - 1
+            pre_release_frame = min(max(1, int(round(last_frame * 0.24))), last_frame)
+            release_frame = min(
+                max(pre_release_frame + 1, int(round(last_frame * 0.38))),
+                last_frame,
+            )
+            frames_after_release = max(0, last_frame - release_frame)
+            reserve_after_release_hold = 3 if total_frames >= 6 else 2
+            release_hold_frames = min(
+                max(1, int(round(float(session.model_fps)))),
+                max(0, frames_after_release - reserve_after_release_hold),
+            )
+            release_hold_end_frame = min(
+                last_frame,
+                release_frame + release_hold_frames,
+            )
+            final_hold_start_frame = last_frame
+            retreat_limit_frame = last_frame
+            retreat_frame = min(
+                max(release_hold_end_frame + 1, int(round(last_frame * 0.76))),
+                retreat_limit_frame,
+            )
+            normal_frame = retreat_frame
+            model_place_release_frame = release_frame
+
+            if has_dual_place_hold:
+                place_hands = {
+                    side: (
+                        workflow.picked_rack_objects_by_hand[side],
+                        np.asarray(workflow.pick_object_hand_offsets_by_side[side], dtype=np.float64),
+                    )
+                    for side in ("right", "left")
+                }
+                model_place_hand_side = "both"
+            else:
+                place_hands = {
+                    workflow.pick_hand_side: (
+                        workflow.picked_rack_object,
+                        np.asarray(workflow.pick_object_hand_offset, dtype=np.float64),
+                    )
+                }
+                model_place_hand_side = workflow.pick_hand_side
+
+            hand_positions = np.repeat(last_positions_world[None, ...], total_frames, axis=0)
+            hand_rotations = np.repeat(last_rotations[None, ...], total_frames, axis=0)
+            place_specs: dict[str, dict[str, object]] = {}
+            backward_from_counter = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+            for place_side, (place_object_key, hand_offset_local) in place_hands.items():
+                hand_label = "Left" if place_side == "left" else "Right"
+                active_hand_names = (
+                    session.skeleton.left_hand_joint_names
+                    if place_side == "left"
+                    else session.skeleton.right_hand_joint_names
+                )
+                active_hand_indices = [
+                    session.skeleton.bone_order_names.index(name) for name in active_hand_names
+                ]
+                hand_root_index = active_hand_indices[0]
+                middle_name = (
+                    f"{hand_label}HandMiddleEnd"
+                    if f"{hand_label}HandMiddleEnd" in session.skeleton.bone_order_names
+                    else active_hand_names[-1]
+                )
+                middle_index = session.skeleton.bone_order_names.index(middle_name)
+                active_lateral = right_lateral if place_side == "right" else -right_lateral
+                wrist_start = last_positions_world[hand_root_index]
+                middle_start = last_positions_world[middle_index]
+                palm_start = 0.35 * wrist_start + 0.65 * middle_start
+                palm_from_wrist = palm_start - wrist_start
+                carried_object_start = (
+                    palm_start
+                    + last_rotations[hand_root_index] @ hand_offset_local
+                )
+                object_release_position = np.array(
+                    [
+                        float(np.clip(carried_object_start[0], table_x_min, table_x_max)),
+                        COUNTER_TABLE_HEIGHT_M + RACK_PICK_OBJECT_SIZE_M / 2.0 + 0.005,
+                        float(np.clip(carried_object_start[2], table_z_min, table_z_max)),
+                    ],
+                    dtype=np.float64,
+                )
+                if has_dual_place_hold:
+                    object_release_position[0] = float(
+                        np.clip(
+                            object_release_position[0] + (0.07 if place_side == "right" else -0.07),
+                            table_x_min,
+                            table_x_max,
+                        )
+                    )
+                release_target = (
+                    object_release_position
+                    - last_rotations[hand_root_index] @ hand_offset_local
+                    - palm_from_wrist
+                )
+                pre_release_target = release_target + np.array([0.0, 0.02, 0.0]) + 0.02 * backward_from_counter
+                retreat_target = (
+                    release_target
+                    + 0.14 * backward_from_counter
+                    + 0.10 * active_lateral
+                    + np.array([0.0, 0.06, 0.0])
+                )
+                retreat_target[2] = min(float(retreat_target[2]), table_z_min - 0.12)
+                normal_target = retreat_target.copy()
+                hand_target_path = _smooth_waypoint_path(
+                    total_frames,
+                    [
+                        (0, last_positions_world[hand_root_index]),
+                        (pre_release_frame, pre_release_target),
+                        (release_frame, release_target),
+                        (release_hold_end_frame, release_target),
+                        (retreat_frame, retreat_target),
+                        (total_frames - 1, normal_target),
+                    ],
+                )
+                target_hand_rotations = np.full(
+                    (total_frames, 3, 3),
+                    np.nan,
+                    dtype=np.float64,
+                )
+                target_hand_rotations[:] = last_rotations[hand_root_index]
+                for frame in range(total_frames):
+                    hand_positions[frame, active_hand_indices] += (
+                        hand_target_path[frame] - last_positions_world[hand_root_index]
+                    )
+                place_specs[place_side] = {
+                    "object_key": place_object_key,
+                    "object_release_position": object_release_position,
+                    "pre_release_target": pre_release_target,
+                    "release_target": release_target,
+                    "retreat_target": retreat_target,
+                    "normal_target": normal_target,
+                    "hand_target_path": hand_target_path,
+                    "hand_target_world": normal_target,
+                    "target_hand_rotations": target_hand_rotations,
+                    "elbow_bend_hint": active_lateral + np.array([0.0, -0.35, -0.18]),
+                    "hand_root_index": hand_root_index,
+                    "hand_start_position": last_positions_world[hand_root_index],
+                }
+            primary_place_side = "right" if "right" in place_specs else next(iter(place_specs))
+            primary_place_spec = place_specs[primary_place_side]
+            model_place_specs = place_specs if has_dual_place_hold else None
+            model_place_target_hand_rotations = primary_place_spec["target_hand_rotations"]
+            place_constraint_debug_path = _save_counter_place_constraint_debug_json(
+                object_key=primary_place_spec["object_key"],
+                total_frames=total_frames,
+                fps=float(session.model_fps),
+                root_position=last_positions_world[root_index],
+                pre_release_frame=pre_release_frame,
+                release_frame=release_frame,
+                release_hold_end_frame=release_hold_end_frame,
+                retreat_frame=retreat_frame,
+                normal_frame=normal_frame,
+                object_release_position=primary_place_spec["object_release_position"],
+                pre_release_target=primary_place_spec["pre_release_target"],
+                release_target=primary_place_spec["release_target"],
+                retreat_target=primary_place_spec["retreat_target"],
+                normal_target=primary_place_spec["normal_target"],
+                root_path=stationary_root,
+                right_hand_path=primary_place_spec["hand_target_path"],
+                right_hand_start_position=primary_place_spec["hand_start_position"],
+            )
+            end_effector_constraint.add_interval(
+                "auto_counter_place_limbs",
+                0,
+                total_frames - 1,
+                hand_positions,
+                hand_rotations,
+                ["LeftHand", "LeftFoot", "RightFoot", "RightHand"],
+                {"left-hand", "left-foot", "right-foot", "right-hand"},
+            )
+
+            workflow.place_release_frame = release_frame
+            workflow.place_object_position_world = primary_place_spec["object_release_position"]
+            workflow.place_object_positions_by_hand = {
+                side: np.asarray(spec["object_release_position"], dtype=np.float64).copy()
+                for side, spec in place_specs.items()
+            }
+            workflow.place_reach_start_frame = reach_start_frame
+            workflow.place_hand_target_world = primary_place_spec["hand_target_world"]
+            workflow.place_hand_targets_by_side = {
+                side: np.asarray(spec["hand_target_world"], dtype=np.float64).copy()
+                for side, spec in place_specs.items()
+            }
+            workflow.place_target_path_world = primary_place_spec["hand_target_path"]
+            workflow.place_target_paths_by_side = {
+                side: np.asarray(spec["hand_target_path"], dtype=np.float64).copy()
+                for side, spec in place_specs.items()
+            }
+            workflow.place_elbow_bend_hint_world = primary_place_spec["elbow_bend_hint"]
+            workflow.place_elbow_bend_hints_by_side = {
+                side: np.asarray(spec["elbow_bend_hint"], dtype=np.float64).copy()
+                for side, spec in place_specs.items()
+            }
+            session.first_heading_angle = 0.0
+            session.constrained_root_heading_angle = None
+            session.constrained_root_initial_turn_angle = None
+            session.constrained_root_turn_end_frame = None
+            session.constrained_root_headings = [0.0] * total_frames
+            session.generation_world_offset = None
+            session.hide_constraint_overlays = True
+            session.human_route_kind = "counter_place"
+            if has_dual_place_hold:
+                prompts = [
+                    "An ordinary healthy person stands still at the counter while holding two small objects, "
+                    "one in each hand. They move both arms to mirrored safe pre-release positions above the "
+                    "counter without changing either hand orientation, lower both hands only 2 cm to the "
+                    "release positions, hold still for one second while releasing both objects onto the "
+                    "counter, move both empty hands diagonally backward/outward and slightly upward until they are outside the "
+                    "counter edge, then stop and hold those cleared poses until the end while keeping the same hand "
+                    "orientations. Do not add a later normal-pose travel segment, extra hand motion, or extra wrist "
+                    "rotation. The empty hands must not touch the table or collide with the body. The body and feet remain still."
+                ]
+            else:
+                other_hand_side = "left" if model_place_hand_side == "right" else "right"
+                prompts = [
+                    "An ordinary healthy person stands still at the counter while holding a small object "
+                    f"in the {model_place_hand_side} hand. They move only the {model_place_hand_side} arm to a safe pre-release position above "
+                    "the counter without changing the hand orientation, lower the hand only 2 cm to "
+                    "the release position, hold still for one second while releasing the object onto the "
+                    "counter, move the empty hand diagonally backward/outward and slightly upward until it is outside the "
+                    "counter edge, then stop and hold that cleared pose until the end while keeping the "
+                    "same hand orientation. Do not add a later normal-pose travel segment, extra hand "
+                    "motion, or extra wrist rotation. The empty hand must not touch the table or collide "
+                    f"with the body. The body, feet, and {other_hand_side} arm remain still."
+                ]
+            strengthen_neutral_walk_guidance()
+            cfg_weight = list(cfg_weight or [3.5, 3.0])
+            if len(cfg_weight) > 1:
+                cfg_weight[1] = max(float(cfg_weight[1]), 5.0)
+            postprocess_parameters = dict(postprocess_parameters or {})
+            postprocess_parameters["post_processing"] = True
+            postprocess_parameters["root_margin"] = min(
+                float(postprocess_parameters.get("root_margin", 0.04)),
+                0.02,
+            )
+            client.add_notification(
+                title="Counter place constraints applied",
+                body=(
+                    f"Pre-release at frame {pre_release_frame}, release at frame {release_frame}, "
+                    f"waits until frame {release_hold_end_frame}, then retreats and returns to normal.\n\n"
+                    + ("Both hands place their held objects.\n\n" if has_dual_place_hold else "")
+                    + f"Saved constraint debug JSON:\n{place_constraint_debug_path}"
+                ),
+                auto_close_seconds=7.0,
+                color="green",
+            )
+            self._apply_constraint_overlay_visibility(session)
+        elif requested_rack_transfer is not None:
+            session = self.client_sessions[client.client_id]
+            source_rack = requested_rack_transfer.source_rack
+            target_rack = requested_rack_transfer.target_rack
+            for rack_name in (source_rack, target_rack):
+                if rack_name not in RACK_MAP_POSITIONS:
+                    available_racks = ", ".join(name.replace("_", " ") for name in RACK_MAP_POSITIONS)
+                    raise ValueError(
+                        f"Unknown warehouse rack {rack_name.replace('_', ' ')}. "
+                        f"Available racks: {available_racks}."
+                    )
+            if len(num_frames) != 1 or num_frames[0] < 2:
+                raise ValueError("A rack-to-rack prompt must contain one motion segment of at least two frames.")
+
+            root_constraint = session.constraints.get("2D Root")
+            fullbody_constraint = session.constraints.get("Full-Body")
+            end_effector_constraint = session.constraints.get("End-Effectors")
+            if root_constraint is None:
+                raise RuntimeError("The active Kimodo model does not provide a 2D Root constraint track.")
+            if fullbody_constraint is None or end_effector_constraint is None:
+                raise RuntimeError("The active Kimodo model does not provide all rack-to-rack constraint tracks.")
+
+            x_near = WORK_AREA_SIDE_SHIFT_M
+            x_far = x_near - WORK_AREA_GRID_SHAPE[0] * WORK_AREA_GRID_SECTION_M
+            z_far = -WORK_AREA_GRID_SHAPE[1] * WORK_AREA_GRID_SECTION_M
+            source_position, source_heading = rack_width_side_approach_pose(
+                RACK_MAP_POSITIONS[source_rack],
+                RACK_MAP_YAWS_RAD.get(source_rack, 0.0),
+                RACK_WIDTH_M,
+                RACK_HUMAN_APPROACH_CLEARANCE_M,
+                (x_far, x_near),
+                (z_far, 0.0),
+            )
+            target_position, target_heading = rack_width_side_approach_pose(
+                RACK_MAP_POSITIONS[target_rack],
+                RACK_MAP_YAWS_RAD.get(target_rack, 0.0),
+                RACK_WIDTH_M,
+                RACK_HUMAN_APPROACH_CLEARANCE_M,
+                (x_far, x_near),
+                (z_far, 0.0),
+            )
+            start_position = tuple(float(value) for value in source_position)
+            start_heading = float(source_heading)
+            transfer_initial_positions: np.ndarray | None = None
+            transfer_initial_rotations: np.ndarray | None = None
+            if session.motions:
+                current_motion = next(iter(session.motions.values()))
+                current_root = (
+                    current_motion.joints_pos[-1, current_motion.skeleton.root_idx]
+                    .detach()
+                    .cpu()
+                    .numpy()
+                    .astype(np.float64)
+                )
+                if float(np.linalg.norm(current_root[[0, 2]] - np.asarray(source_position)[[0, 2]])) <= 0.45:
+                    start_position = tuple(float(value) for value in current_root)
+                    if (
+                        session.constrained_root_headings is not None
+                        and len(session.constrained_root_headings) > 0
+                    ):
+                        start_heading = float(session.constrained_root_headings[-1])
+                    transfer_initial_positions = current_motion.joints_pos[-1].detach().cpu().numpy()
+                    transfer_initial_rotations = current_motion.joints_rot[-1].detach().cpu().numpy()
+                    if (
+                        workflow is not None
+                        and workflow.pick_grasp_verified
+                    ):
+                        if (
+                            workflow.picked_rack_objects_by_hand
+                            and workflow.pick_object_hand_offsets_by_side
+                        ):
+                            requested_rack_transfer_holding_pick = True
+                            model_transfer_hold_rotations = transfer_initial_rotations.copy()
+                            model_transfer_picked_object = None
+                            model_transfer_hand_offset = None
+                            model_transfer_picked_objects_by_hand = dict(
+                                workflow.picked_rack_objects_by_hand
+                            )
+                            model_transfer_hand_offsets_by_side = {
+                                side: np.asarray(offset, dtype=np.float64).copy()
+                                for side, offset in workflow.pick_object_hand_offsets_by_side.items()
+                            }
+                            model_transfer_hand_side = "both"
+                        elif (
+                            workflow.picked_rack_object is not None
+                            and workflow.pick_object_hand_offset is not None
+                        ):
+                            requested_rack_transfer_holding_pick = True
+                            model_transfer_hold_rotations = transfer_initial_rotations.copy()
+                            model_transfer_picked_object = workflow.picked_rack_object
+                            model_transfer_hand_offset = np.asarray(
+                                workflow.pick_object_hand_offset,
+                                dtype=np.float64,
+                            ).copy()
+                            model_transfer_hand_side = workflow.pick_hand_side
+
+            rack_transfer_route = _plan_cardinal_rack_transfer_route(
+                start_position=start_position,
+                start_heading=start_heading,
+                target_position=tuple(float(value) for value in target_position),
+                final_heading=float(target_heading),
+                total_frames=int(num_frames[0]),
+                fps=float(session.model_fps),
+                walk_speed_m_s=_rack_human_walk_speed_m_s(target_rack),
+                first_axis="x" if source_rack in {"rack_1", "rack_2"} else "z",
+                reverse_distance=0.12 if requested_rack_transfer_holding_pick else 0.08,
+                reverse_seconds=0.60 if requested_rack_transfer_holding_pick else 0.40,
+            )
+            if any(
+                not (x_far <= position[0] <= x_near and z_far <= position[2] <= 0.0)
+                for position in rack_transfer_route.positions
+            ):
+                raise ValueError("The planned rack-to-rack route leaves the orange boundary.")
+
+            session.first_heading_angle = rack_transfer_route.headings[0]
+            session.constrained_root_heading_angle = None
+            session.constrained_root_initial_turn_angle = None
+            session.constrained_root_turn_end_frame = None
+            session.constrained_root_headings = list(rack_transfer_route.headings)
+            session.generation_world_offset = None
+            session.hide_constraint_overlays = True
+            session.human_route_rack = target_rack
+            session.human_route_kind = "outbound"
+            for constraint in (root_constraint, fullbody_constraint, end_effector_constraint):
+                constraint.clear()
+            root_constraint.set_smooth_path(False)
+            root_constraint.add_interval(
+                f"auto_{source_rack}_to_{target_rack}_cardinal_route",
+                0,
+                int(num_frames[0]) - 1,
+                np.asarray(rack_transfer_route.positions, dtype=np.float64),
+            )
+            root_constraint.set_dense_path(True)
+            if transfer_initial_positions is not None and transfer_initial_rotations is not None:
+                initial_pose_frames = min(max(5, int(round(0.25 * float(session.model_fps)))), int(num_frames[0]))
+                fullbody_constraint.add_interval(
+                    f"auto_{source_rack}_to_{target_rack}_start_pose",
+                    0,
+                    initial_pose_frames - 1,
+                    np.repeat(transfer_initial_positions[None, ...], initial_pose_frames, axis=0),
+                    np.repeat(transfer_initial_rotations[None, ...], initial_pose_frames, axis=0),
+                )
+                if rack_transfer_route.reverse_end_frame > 0:
+                    reverse_pose_frames = min(rack_transfer_route.reverse_end_frame + 1, int(num_frames[0]))
+                    fullbody_constraint.add_interval(
+                        f"auto_{source_rack}_to_{target_rack}_reverse_slide_pose",
+                        0,
+                        reverse_pose_frames - 1,
+                        np.repeat(transfer_initial_positions[None, ...], reverse_pose_frames, axis=0),
+                        np.repeat(transfer_initial_rotations[None, ...], reverse_pose_frames, axis=0),
+                    )
+            prompts = [
+                (
+                    "An ordinary healthy person carefully carries the held object or objects "
+                    "in front of the chest. They keep the holding arm poses steady relative to the torso, "
+                    "slide slightly backward from the rack while staying upright, make controlled in-place "
+                    "turns, walk forward along the aisle at a steady pace, turn to face the next rack, "
+                    "then walk forward into the same final rack approach position, "
+                    f"and finish standing upright in front of {target_rack.replace('_', ' ')}. "
+                    "No sitting, crouching, skating, or squatting."
+                )
+                if requested_rack_transfer_holding_pick
+                else (
+                    "An ordinary healthy person walks at a steady normal pace from one rack to another. "
+                    f"They start in front of {source_rack.replace('_', ' ')}, slide slightly backward "
+                    "from the rack while staying upright, make controlled in-place turns at the aisle corners, walk forward "
+                    f"normally, and finish standing naturally in front of {target_rack.replace('_', ' ')} "
+                    "facing the rack. No sitting, crouching, skating, or squatting."
+                )
+            ]
+            strengthen_neutral_walk_guidance()
+            postprocess_parameters = dict(postprocess_parameters or {})
+            postprocess_parameters["post_processing"] = True
+            postprocess_parameters["root_margin"] = min(
+                float(postprocess_parameters.get("root_margin", 0.04)),
+                0.02,
+            )
+            client.add_notification(
+                title=(
+                    f"{source_rack.replace('_', ' ').title()} to "
+                    f"{target_rack.replace('_', ' ').title()} route applied"
+                ),
+                body=(
+                    f"Starts at X {start_position[0]:.2f} m, Z {start_position[2]:.2f} m; "
+                    f"ends at the same approach pose as `move to {target_rack.replace('_', ' ')}`: "
+                    f"X {target_position[0]:.2f} m, Z {target_position[2]:.2f} m. "
+                    f"Final heading: {np.rad2deg(target_heading):.1f} degrees. "
+                    f"Stationary turns: {rack_transfer_route.turn_degrees}."
+                ),
+                auto_close_seconds=7.0,
+                color="green",
+            )
+            self._apply_constraint_overlay_visibility(session)
         elif requested_rack is not None:
             if requested_rack not in RACK_MAP_POSITIONS:
                 available_racks = ", ".join(name.replace("_", " ") for name in RACK_MAP_POSITIONS)
@@ -3245,8 +5043,11 @@ class RobotDemo(Demo):
                 for key, handle in workflow.rack_object_handles.items():
                     handle.position = workflow.rack_object_home_positions[key]
                 workflow.picked_rack_object = None
+                workflow.picked_rack_objects_by_hand.clear()
                 workflow.pick_hold_start_frame = None
+                workflow.pick_hold_start_frames_by_side.clear()
                 workflow.pick_object_hand_offset = None
+                workflow.pick_object_hand_offsets_by_side.clear()
                 workflow.pick_reach_start_frame = None
                 workflow.pick_hand_target_world = None
                 workflow.pick_target_path_world = None
@@ -3270,14 +5071,14 @@ class RobotDemo(Demo):
                 (x_far, x_near),
                 (z_far, 0.0),
             )
-            rack_walk_speed_m_s = 0.60 if requested_rack == "rack_1" else 0.90
+            rack_walk_speed_m_s = _rack_human_walk_speed_m_s(requested_rack)
             route = plan_cardinal_rack_route(
                 approach_position=rack_target,
                 final_heading=rack_facing_heading,
                 total_frames=int(num_frames[0]),
                 fps=float(session.model_fps),
                 walk_speed_m_s=rack_walk_speed_m_s,
-                first_axis="z" if requested_rack in {"rack_1", "rack_2"} else "x",
+                first_axis="z" if requested_rack in {"rack_1", "rack_2", "rack_3"} else "x",
             )
             session.first_heading_angle = route.headings[0]
             session.constrained_root_heading_angle = None
@@ -3363,7 +5164,119 @@ class RobotDemo(Demo):
                     outbound_motion.joints_pos[-1].detach().cpu().numpy().copy(),
                     outbound_motion.joints_rot[-1].detach().cpu().numpy().copy(),
                 )
-        if requested_human_pick is not None and workflow is not None:
+        if requested_rack_transfer is not None:
+            session = self.client_sessions[client.client_id]
+            if session.motions:
+                transfer_motion = next(iter(session.motions.values()))
+                if rack_transfer_route is not None:
+                    route_positions = np.asarray(rack_transfer_route.positions, dtype=np.float64)
+                    frame_count = min(transfer_motion.length, len(route_positions))
+                    root_index = transfer_motion.skeleton.root_idx
+                    target_root_positions = torch.as_tensor(
+                        route_positions[:frame_count],
+                        device=transfer_motion.joints_pos.device,
+                        dtype=transfer_motion.joints_pos.dtype,
+                    )
+                    root_delta = target_root_positions - transfer_motion.joints_pos[:frame_count, root_index]
+                    root_delta[:, 1] = 0.0
+                    transfer_motion.joints_pos[:frame_count] = (
+                        transfer_motion.joints_pos[:frame_count] + root_delta[:, None, :]
+                    )
+                    foot_indices = list(getattr(transfer_motion.skeleton, "foot_joint_idx", []) or [])
+                    if foot_indices:
+                        foot_y = transfer_motion.joints_pos[:frame_count, foot_indices, 1]
+                        floor_delta_y = -torch.min(foot_y, dim=1).values
+                        transfer_motion.joints_pos[:frame_count, :, 1] += floor_delta_y[:, None]
+                    transfer_motion.precompute_mesh_info()
+                    self.set_frame(client.client_id, 0)
+                if (
+                    requested_rack_transfer_holding_pick
+                    and workflow is not None
+                    and model_transfer_hold_rotations is not None
+                ):
+                    if model_transfer_hand_side == "both":
+                        _hold_right_arm_local_pose(
+                            transfer_motion,
+                            model_transfer_hold_rotations,
+                            side="right",
+                        )
+                        _hold_right_arm_local_pose(
+                            transfer_motion,
+                            model_transfer_hold_rotations,
+                            side="left",
+                        )
+                        workflow.picked_rack_object = None
+                        workflow.pick_object_hand_offset = None
+                        workflow.picked_rack_objects_by_hand = dict(
+                            model_transfer_picked_objects_by_hand or {}
+                        )
+                        workflow.pick_object_hand_offsets_by_side = {
+                            side: np.asarray(offset, dtype=np.float64).copy()
+                            for side, offset in (model_transfer_hand_offsets_by_side or {}).items()
+                        }
+                        workflow.pick_hold_start_frames_by_side = {
+                            side: 0 for side in workflow.picked_rack_objects_by_hand
+                        }
+                        workflow.pick_hand_side = "right"
+                    else:
+                        _hold_right_arm_local_pose(
+                            transfer_motion,
+                            model_transfer_hold_rotations,
+                            side=model_transfer_hand_side,
+                        )
+                        workflow.picked_rack_object = model_transfer_picked_object
+                        workflow.pick_object_hand_offset = model_transfer_hand_offset
+                        workflow.picked_rack_objects_by_hand.clear()
+                        workflow.pick_object_hand_offsets_by_side.clear()
+                        workflow.pick_hold_start_frames_by_side.clear()
+                        workflow.pick_hand_side = model_transfer_hand_side
+                    workflow.pick_hold_start_frame = 0
+                    workflow.pick_reach_start_frame = 0
+                    workflow.pick_hand_target_world = None
+                    workflow.pick_target_path_world = None
+                    workflow.pick_grasp_target_world = None
+                    workflow.pick_elbow_bend_hint_world = None
+                    workflow.place_release_frame = None
+                    workflow.place_object_position_world = None
+                    workflow.place_object_positions_by_hand.clear()
+                    workflow.place_reach_start_frame = None
+                    workflow.place_hand_target_world = None
+                    workflow.place_hand_targets_by_side.clear()
+                    workflow.place_target_path_world = None
+                    workflow.place_target_paths_by_side.clear()
+                    workflow.place_elbow_bend_hint_world = None
+                    workflow.place_elbow_bend_hints_by_side.clear()
+                    workflow.pick_grasp_verified = True
+                    self.set_frame(client.client_id, 0)
+                session.human_outbound_rack_poses[requested_rack_transfer.target_rack] = (
+                    transfer_motion.joints_pos[-1].detach().cpu().numpy().copy(),
+                    transfer_motion.joints_rot[-1].detach().cpu().numpy().copy(),
+                )
+                session.human_route_rack = requested_rack_transfer.target_rack
+                session.human_route_kind = "outbound"
+        if requested_human_return is not None:
+            session = self.client_sessions[client.client_id]
+            if session.motions:
+                motion = next(iter(session.motions.values()))
+                route_positions = np.asarray(route.positions, dtype=np.float64)
+                frame_count = min(motion.length, len(route_positions))
+                root_index = motion.skeleton.root_idx
+                target_root_positions = torch.as_tensor(
+                    route_positions[:frame_count],
+                    device=motion.joints_pos.device,
+                    dtype=motion.joints_pos.dtype,
+                )
+                root_delta = target_root_positions - motion.joints_pos[:frame_count, root_index]
+                root_delta[:, 1] = 0.0
+                motion.joints_pos[:frame_count] = motion.joints_pos[:frame_count] + root_delta[:, None, :]
+                foot_indices = list(getattr(motion.skeleton, "foot_joint_idx", []) or [])
+                if foot_indices:
+                    foot_y = motion.joints_pos[:frame_count, foot_indices, 1]
+                    floor_delta_y = -torch.min(foot_y, dim=1).values
+                    motion.joints_pos[:frame_count, :, 1] += floor_delta_y[:, None]
+                motion.precompute_mesh_info()
+                self.set_frame(client.client_id, 0)
+        if (requested_dual_pick is not None or requested_human_pick is not None) and workflow is not None:
             session = self.client_sessions[client.client_id]
             if (
                 session.motions
@@ -3376,88 +5289,210 @@ class RobotDemo(Demo):
             ):
                 motion = next(iter(session.motions.values()))
                 base_positions, base_rotations = model_pick_base_pose
-                _freeze_body_except_right_arm(
-                    motion,
-                    base_rotations,
-                    base_positions[motion.skeleton.root_idx],
-                )
-                _enforce_right_arm_reach(
-                    motion,
-                    workflow.pick_reach_start_frame,
-                    workflow.pick_hold_start_frame,
-                    workflow.pick_hand_target_world,
-                    target_path_world=workflow.pick_target_path_world,
-                    target_hand_rotations_world=model_pick_target_hand_rotations,
-                    target_palm_normals_world=model_pick_target_palm_normals,
-                    palm_normal_local=model_pick_palm_normal_local,
-                    elbow_bend_hint_world=workflow.pick_elbow_bend_hint_world,
-                    refresh_cache=False,
-                )
-                hand_index = motion.skeleton.bone_order_names.index(
-                    motion.skeleton.right_hand_joint_names[0]
-                )
-                middle_name = (
-                    "RightHandMiddleEnd"
-                    if "RightHandMiddleEnd" in motion.skeleton.bone_order_names
-                    else motion.skeleton.right_hand_joint_names[-1]
-                )
-                middle_index = motion.skeleton.bone_order_names.index(middle_name)
-                grasp_frame = workflow.pick_hold_start_frame
-                wrist_grasp = motion.joints_pos[grasp_frame, hand_index].detach().cpu().numpy()
-                middle_grasp = motion.joints_pos[grasp_frame, middle_index].detach().cpu().numpy()
-                palm_grasp = 0.35 * wrist_grasp + 0.65 * middle_grasp
-                object_position = workflow.rack_object_home_positions[workflow.picked_rack_object]
-                palm_correction = np.asarray(object_position) - palm_grasp
-                corrected_path = workflow.pick_target_path_world.copy()
-                correction_start = max(0, int(round(motion.length * 0.20)))
-                for frame in range(correction_start, motion.length):
-                    progress = min(
-                        1.0,
-                        (frame - correction_start) / max(1, grasp_frame - correction_start),
+                active_specs = model_dual_pick_specs
+                if active_specs is None:
+                    active_specs = {
+                        model_pick_hand_side: {
+                            "object_key": workflow.picked_rack_object,
+                            "hand_target_path": workflow.pick_target_path_world,
+                            "hand_target_world": workflow.pick_hand_target_world,
+                            "palm_normal_local": model_pick_palm_normal_local,
+                            "target_palm_normals": model_pick_target_palm_normals,
+                            "elbow_bend_hint": workflow.pick_elbow_bend_hint_world,
+                        }
+                    }
+                    _freeze_body_except_right_arm(
+                        motion,
+                        base_rotations,
+                        base_positions[motion.skeleton.root_idx],
+                        side=model_pick_hand_side,
                     )
-                    progress = progress * progress * (3.0 - 2.0 * progress)
-                    corrected_path[frame] += progress * palm_correction
-                workflow.pick_target_path_world = corrected_path
-                workflow.pick_hand_target_world = corrected_path[-1]
-                final_error = _enforce_right_arm_reach(
-                    motion,
-                    workflow.pick_reach_start_frame,
-                    grasp_frame,
-                    workflow.pick_hand_target_world,
-                    target_path_world=corrected_path,
-                    target_hand_rotations_world=model_pick_target_hand_rotations,
-                    target_palm_normals_world=model_pick_target_palm_normals,
-                    palm_normal_local=model_pick_palm_normal_local,
-                    elbow_bend_hint_world=workflow.pick_elbow_bend_hint_world,
-                    refresh_cache=True,
-                )
-                wrist_grasp = motion.joints_pos[grasp_frame, hand_index].detach().cpu().numpy()
-                middle_grasp = motion.joints_pos[grasp_frame, middle_index].detach().cpu().numpy()
-                palm_grasp = 0.35 * wrist_grasp + 0.65 * middle_grasp
-                palm_error = float(np.linalg.norm(palm_grasp - object_position))
-                hand_rotation_grasp = motion.joints_rot[grasp_frame, hand_index].detach().cpu().numpy()
-                workflow.pick_object_hand_offset = (
-                    hand_rotation_grasp.T @ (np.asarray(object_position) - palm_grasp)
-                )
+                else:
+                    _freeze_body_except_arm_sides(
+                        motion,
+                        base_rotations,
+                        base_positions[motion.skeleton.root_idx],
+                        set(active_specs.keys()),
+                    )
+
+                grasp_frame = workflow.pick_hold_start_frame
                 chest_index = motion.skeleton.bone_order_names.index("Chest")
-                palm_final = (
-                    0.35 * motion.joints_pos[-1, hand_index]
-                    + 0.65 * motion.joints_pos[-1, middle_index]
-                ).detach().cpu().numpy()
                 chest_final = motion.joints_pos[-1, chest_index].detach().cpu().numpy()
-                body_clearance = float(np.linalg.norm(palm_final - chest_final))
-                # The selectable rack objects are 6 cm cubes. A 5 cm palm-center
-                # tolerance still places the gripper over the object volume while
-                # avoiding false failures from small wrist/retarget offsets.
-                palm_grasp_tolerance = 0.05
+                max_final_error = 0.0
+                max_palm_error = 0.0
+                min_body_clearance = float("inf")
+                per_hand_errors: dict[str, float] = {}
+                workflow.pick_object_hand_offsets_by_side.clear()
+                workflow.pick_object_hand_offsets_by_side.update(
+                    {
+                        side: offset.copy()
+                        for side, offset in model_pick_existing_offsets_by_hand.items()
+                    }
+                )
+                side_runtime: dict[str, dict[str, object]] = {}
+                for side, spec in active_specs.items():
+                    target_path = np.asarray(spec["hand_target_path"], dtype=np.float64)
+                    target_world = np.asarray(spec["hand_target_world"], dtype=np.float64)
+                    palm_normal_local = spec["palm_normal_local"]
+                    target_palm_normals = spec["target_palm_normals"]
+                    elbow_bend_hint = spec["elbow_bend_hint"]
+                    _enforce_right_arm_reach(
+                        motion,
+                        workflow.pick_reach_start_frame,
+                        grasp_frame,
+                        target_world,
+                        target_path_world=target_path,
+                        target_hand_rotations_world=model_pick_target_hand_rotations,
+                        target_palm_normals_world=target_palm_normals,
+                        palm_normal_local=palm_normal_local,
+                        elbow_bend_hint_world=elbow_bend_hint,
+                        refresh_cache=False,
+                        side=side,
+                    )
+                    active_hand_names = (
+                        motion.skeleton.left_hand_joint_names
+                        if side == "left"
+                        else motion.skeleton.right_hand_joint_names
+                    )
+                    hand_label = "Left" if side == "left" else "Right"
+                    hand_index = motion.skeleton.bone_order_names.index(active_hand_names[0])
+                    middle_name = (
+                        f"{hand_label}HandMiddleEnd"
+                        if f"{hand_label}HandMiddleEnd" in motion.skeleton.bone_order_names
+                        else active_hand_names[-1]
+                    )
+                    middle_index = motion.skeleton.bone_order_names.index(middle_name)
+                    object_key = spec["object_key"]
+                    object_position = np.asarray(
+                        workflow.rack_object_home_positions[object_key],
+                        dtype=np.float64,
+                    )
+                    correction_start = int(
+                        spec.get(
+                            "correction_start_frame",
+                            max(0, int(round(motion.length * 0.20))),
+                        )
+                    )
+                    correction_start = min(correction_start, max(0, grasp_frame - 1))
+                    side_runtime[side] = {
+                        "spec": spec,
+                        "target_path": target_path.copy(),
+                        "palm_normal_local": palm_normal_local,
+                        "target_palm_normals": target_palm_normals,
+                        "elbow_bend_hint": elbow_bend_hint,
+                        "hand_index": hand_index,
+                        "middle_index": middle_index,
+                        "object_position": object_position,
+                        "correction_start": correction_start,
+                    }
+
+                correction_passes = 4 if model_dual_pick_specs is not None else 2
+                for _ in range(correction_passes):
+                    all_close = True
+                    for side, runtime in side_runtime.items():
+                        spec = runtime["spec"]
+                        corrected_path = runtime["target_path"]
+                        hand_index = int(runtime["hand_index"])
+                        middle_index = int(runtime["middle_index"])
+                        object_position = np.asarray(runtime["object_position"], dtype=np.float64)
+                        correction_start = int(runtime["correction_start"])
+                        wrist_grasp = motion.joints_pos[grasp_frame, hand_index].detach().cpu().numpy()
+                        middle_grasp = motion.joints_pos[grasp_frame, middle_index].detach().cpu().numpy()
+                        palm_grasp = 0.35 * wrist_grasp + 0.65 * middle_grasp
+                        palm_correction = object_position - palm_grasp
+                        for frame in range(correction_start, motion.length):
+                            progress = min(
+                                1.0,
+                                (frame - correction_start) / max(1, grasp_frame - correction_start),
+                            )
+                            progress = progress * progress * (3.0 - 2.0 * progress)
+                            corrected_path[frame] += progress * palm_correction
+                        spec["hand_target_path"] = corrected_path
+                        spec["hand_target_world"] = corrected_path[-1]
+                        final_error = _enforce_right_arm_reach(
+                            motion,
+                            workflow.pick_reach_start_frame,
+                            grasp_frame,
+                            corrected_path[-1],
+                            target_path_world=corrected_path,
+                            target_hand_rotations_world=model_pick_target_hand_rotations,
+                            target_palm_normals_world=runtime["target_palm_normals"],
+                            palm_normal_local=runtime["palm_normal_local"],
+                            elbow_bend_hint_world=runtime["elbow_bend_hint"],
+                            refresh_cache=False,
+                            side=side,
+                        )
+                        wrist_grasp = motion.joints_pos[grasp_frame, hand_index].detach().cpu().numpy()
+                        middle_grasp = motion.joints_pos[grasp_frame, middle_index].detach().cpu().numpy()
+                        palm_grasp = 0.35 * wrist_grasp + 0.65 * middle_grasp
+                        palm_error = float(np.linalg.norm(palm_grasp - object_position))
+                        runtime["target_path"] = corrected_path
+                        runtime["final_error"] = final_error
+                        runtime["palm_error"] = palm_error
+                        if palm_error > 0.025:
+                            all_close = False
+                    if all_close:
+                        break
+
+                for side, runtime in side_runtime.items():
+                    hand_index = int(runtime["hand_index"])
+                    middle_index = int(runtime["middle_index"])
+                    object_position = np.asarray(runtime["object_position"], dtype=np.float64)
+                    wrist_grasp = motion.joints_pos[grasp_frame, hand_index].detach().cpu().numpy()
+                    middle_grasp = motion.joints_pos[grasp_frame, middle_index].detach().cpu().numpy()
+                    palm_grasp = 0.35 * wrist_grasp + 0.65 * middle_grasp
+                    palm_error = float(np.linalg.norm(palm_grasp - object_position))
+                    final_error = float(runtime.get("final_error", 0.0))
+                    hand_rotation_grasp = motion.joints_rot[grasp_frame, hand_index].detach().cpu().numpy()
+                    workflow.pick_object_hand_offsets_by_side[side] = (
+                        hand_rotation_grasp.T @ (object_position - palm_grasp)
+                    )
+                    palm_final = (
+                        0.35 * motion.joints_pos[-1, hand_index]
+                        + 0.65 * motion.joints_pos[-1, middle_index]
+                    ).detach().cpu().numpy()
+                    body_clearance = float(np.linalg.norm(palm_final - chest_final))
+                    max_final_error = max(max_final_error, final_error)
+                    max_palm_error = max(max_palm_error, palm_error)
+                    min_body_clearance = min(min_body_clearance, body_clearance)
+                    per_hand_errors[side] = palm_error
+                if model_dual_pick_specs is None:
+                    workflow.pick_object_hand_offset = workflow.pick_object_hand_offsets_by_side.get(model_pick_hand_side)
+                    workflow.pick_target_path_world = active_specs[model_pick_hand_side]["hand_target_path"]
+                    workflow.pick_hand_target_world = active_specs[model_pick_hand_side]["hand_target_world"]
+                    if model_pick_existing_objects_by_hand:
+                        workflow.picked_rack_objects_by_hand = dict(model_pick_existing_objects_by_hand)
+                        workflow.picked_rack_objects_by_hand[model_pick_hand_side] = workflow.picked_rack_object
+                        workflow.picked_rack_object = None
+                        workflow.pick_object_hand_offset = None
+                        workflow.pick_hold_start_frames_by_side.update(
+                            {
+                                side: 0
+                                for side in model_pick_existing_objects_by_hand
+                            }
+                        )
+                        workflow.pick_hold_start_frames_by_side[model_pick_hand_side] = grasp_frame
+                motion.precompute_mesh_info()
+                palm_error = max_palm_error
+                final_error = max_final_error
+                body_clearance = min_body_clearance
+                # The selectable rack objects are 6 cm cubes. A 6.5 cm palm-center
+                # tolerance still keeps the gripper on/near the object volume while
+                # avoiding false failures from tiny wrist/retarget offsets.
+                palm_grasp_tolerance = 0.065
                 workflow.pick_grasp_verified = (
                     palm_error <= palm_grasp_tolerance and body_clearance >= 0.16
                 )
                 if not workflow.pick_grasp_verified or final_error > 0.08:
+                    per_hand_text = ", ".join(
+                        f"{side} {error:.3f} m" for side, error in sorted(per_hand_errors.items())
+                    )
                     raise RuntimeError(
                         f"Collision-safe pick did not converge (palm {palm_error:.3f} m, "
                         f"allowed {palm_grasp_tolerance:.3f} m, chest hold {final_error:.3f} m, "
-                        f"body clearance {body_clearance:.3f} m); "
+                        f"body clearance {body_clearance:.3f} m"
+                        + (f", per-hand {per_hand_text}" if per_hand_text else "")
+                        + "); "
                         "the object was not attached."
                     )
                 self.set_frame(client.client_id, 0)
@@ -3466,10 +5501,193 @@ class RobotDemo(Demo):
                     body=(
                         f"Palm grasp error {palm_error * 100.0:.1f} cm; body clearance "
                         f"{body_clearance * 100.0:.1f} cm."
+                        + (
+                            "\n"
+                            + ", ".join(
+                                f"{side}: {error * 100.0:.1f} cm"
+                                for side, error in sorted(per_hand_errors.items())
+                            )
+                            if len(per_hand_errors) > 1
+                            else ""
+                        )
                     ),
                     auto_close_seconds=5.0,
                     color="green",
                 )
+        if requested_human_place and workflow is not None:
+            session = self.client_sessions[client.client_id]
+            if (
+                session.motions
+                and workflow.place_reach_start_frame is not None
+                and model_place_release_frame is not None
+                and workflow.place_hand_target_world is not None
+                and workflow.place_target_path_world is not None
+                and model_place_base_pose is not None
+            ):
+                motion = next(iter(session.motions.values()))
+                base_positions, base_rotations = model_place_base_pose
+                release_frame = min(model_place_release_frame, motion.length - 1)
+                if model_place_specs is not None:
+                    _freeze_body_except_arm_sides(
+                        motion,
+                        base_rotations,
+                        base_positions[motion.skeleton.root_idx],
+                        set(model_place_specs.keys()),
+                    )
+                    final_error = 0.0
+                    release_error = 0.0
+                    per_hand_errors: dict[str, tuple[float, float]] = {}
+                    for side, spec in model_place_specs.items():
+                        hand_target_world = np.asarray(spec["hand_target_world"], dtype=np.float64)
+                        target_path_world = np.asarray(spec["hand_target_path"], dtype=np.float64)
+                        side_final_error = _enforce_right_arm_reach(
+                            motion,
+                            workflow.place_reach_start_frame,
+                            model_place_release_frame,
+                            hand_target_world,
+                            target_path_world=target_path_world,
+                            target_hand_rotations_world=spec["target_hand_rotations"],
+                            elbow_bend_hint_world=spec["elbow_bend_hint"],
+                            refresh_cache=False,
+                            side=side,
+                        )
+                        active_hand_names = (
+                            motion.skeleton.left_hand_joint_names
+                            if side == "left"
+                            else motion.skeleton.right_hand_joint_names
+                        )
+                        hand_index = motion.skeleton.bone_order_names.index(active_hand_names[0])
+                        side_release_error = float(
+                            np.linalg.norm(
+                                motion.joints_pos[release_frame, hand_index].detach().cpu().numpy()
+                                - target_path_world[release_frame]
+                            )
+                        )
+                        final_error = max(final_error, side_final_error)
+                        release_error = max(release_error, side_release_error)
+                        per_hand_errors[side] = (side_release_error, side_final_error)
+                    motion.precompute_mesh_info()
+                else:
+                    _freeze_body_except_right_arm(
+                        motion,
+                        base_rotations,
+                        base_positions[motion.skeleton.root_idx],
+                        side=model_place_hand_side,
+                    )
+                    final_error = _enforce_right_arm_reach(
+                        motion,
+                        workflow.place_reach_start_frame,
+                        model_place_release_frame,
+                        workflow.place_hand_target_world,
+                        target_path_world=workflow.place_target_path_world,
+                        target_hand_rotations_world=model_place_target_hand_rotations,
+                        elbow_bend_hint_world=workflow.place_elbow_bend_hint_world,
+                        refresh_cache=True,
+                        side=model_place_hand_side,
+                    )
+                    active_hand_names = (
+                        motion.skeleton.left_hand_joint_names
+                        if model_place_hand_side == "left"
+                        else motion.skeleton.right_hand_joint_names
+                    )
+                    hand_index = motion.skeleton.bone_order_names.index(
+                        active_hand_names[0]
+                    )
+                    release_error = float(
+                        np.linalg.norm(
+                            motion.joints_pos[release_frame, hand_index].detach().cpu().numpy()
+                            - workflow.place_target_path_world[release_frame]
+                        )
+                    )
+                    per_hand_errors = {}
+                if release_error > 0.08:
+                    per_hand_text = ", ".join(
+                        f"{side} release {errors[0]:.3f} m, final {errors[1]:.3f} m"
+                        for side, errors in sorted(per_hand_errors.items())
+                    )
+                    raise RuntimeError(
+                        f"Counter place did not converge (release {release_error:.3f} m, "
+                        f"normal {final_error:.3f} m"
+                        + (f", per-hand {per_hand_text}" if per_hand_text else "")
+                        + ")."
+                    )
+                workflow.pick_hold_start_frame = 0
+                workflow.pick_grasp_verified = True
+                self.set_frame(client.client_id, 0)
+                client.add_notification(
+                    title="Counter place enforced",
+                    body=(
+                        f"Release hand error {release_error * 100.0:.1f} cm; "
+                        f"normal-pose error {final_error * 100.0:.1f} cm."
+                    ),
+                    auto_close_seconds=5.0,
+                    color="green",
+                )
+        if (
+            requested_human_return_holding_pick
+            and workflow is not None
+            and model_return_hold_rotations is not None
+        ):
+            session = self.client_sessions[client.client_id]
+            if session.motions:
+                motion = next(iter(session.motions.values()))
+                if model_return_hand_side == "both":
+                    _hold_right_arm_local_pose(motion, model_return_hold_rotations, side="right")
+                    _hold_right_arm_local_pose(motion, model_return_hold_rotations, side="left")
+                    workflow.picked_rack_object = None
+                    workflow.pick_object_hand_offset = None
+                    workflow.picked_rack_objects_by_hand = dict(model_return_picked_objects_by_hand or {})
+                    workflow.pick_object_hand_offsets_by_side = {
+                        side: np.asarray(offset, dtype=np.float64).copy()
+                        for side, offset in (model_return_hand_offsets_by_side or {}).items()
+                    }
+                    workflow.pick_hold_start_frames_by_side = {
+                        side: 0 for side in workflow.picked_rack_objects_by_hand
+                    }
+                    workflow.pick_hand_side = "right"
+                else:
+                    _hold_right_arm_local_pose(motion, model_return_hold_rotations, side=model_return_hand_side)
+                    workflow.picked_rack_object = model_return_picked_object
+                    workflow.pick_object_hand_offset = model_return_hand_offset
+                    workflow.picked_rack_objects_by_hand.clear()
+                    workflow.pick_object_hand_offsets_by_side.clear()
+                    workflow.pick_hold_start_frames_by_side.clear()
+                    workflow.pick_hand_side = model_return_hand_side
+                workflow.pick_hold_start_frame = 0
+                workflow.pick_reach_start_frame = 0
+                workflow.pick_hand_target_world = None
+                workflow.pick_target_path_world = None
+                workflow.pick_grasp_target_world = None
+                workflow.pick_elbow_bend_hint_world = None
+                workflow.place_release_frame = None
+                workflow.place_object_position_world = None
+                workflow.place_object_positions_by_hand.clear()
+                workflow.place_reach_start_frame = None
+                workflow.place_hand_target_world = None
+                workflow.place_hand_targets_by_side.clear()
+                workflow.place_target_path_world = None
+                workflow.place_target_paths_by_side.clear()
+                workflow.place_elbow_bend_hint_world = None
+                workflow.place_elbow_bend_hints_by_side.clear()
+                workflow.pick_grasp_verified = True
+                self.set_frame(client.client_id, 0)
+            client.add_notification(
+                title="Carry return enforced",
+                body=(
+                    (
+                        "Both arm local poses were held from the pick final frame, "
+                        "so both items stay in the hands relative to the body during the return."
+                        if model_return_hand_side == "both"
+                        else (
+                            f"{model_return_hand_side.title()} arm local pose was held from the pick final frame, "
+                            "so the item stays in the hand relative to the body during the return."
+                        )
+                    )
+                ),
+                    auto_close_seconds=5.0,
+                    color="green",
+                )
+
     def _create_robot_pipeline_gui(self, client: viser.ClientHandle) -> None:
         session = self.client_sessions.get(client.client_id)
         if session is None:
@@ -3785,12 +6003,16 @@ class RobotDemo(Demo):
                 memory_status.content = f"No BVH memories found in `{root / 'bvh'}`."
                 return
             bvh_path = _memory_bvh_path(root, stem)
-            csv_path = _memory_csv_path(root, stem)
-            csv_state = "available" if csv_path.is_file() else "missing"
+            t3_csv_path = _memory_t3_csv_path(root, stem)
+            t2_csv_path = _memory_csv_path(root, stem)
+            t3_csv_state = "available" if t3_csv_path.is_file() else "missing"
+            t2_csv_state = "available" if t2_csv_path.is_file() else "missing"
             memory_status.content = (
                 f"BVH: `{bvh_path}`\n\n"
-                f"T2 CSV: `{csv_state}`\n\n"
-                f"`{csv_path}`"
+                f"T3 CSV: `{t3_csv_state}`\n\n"
+                f"`{t3_csv_path}`\n\n"
+                f"T2 CSV fallback: `{t2_csv_state}`\n\n"
+                f"`{t2_csv_path}`"
             )
 
         def update_base_memory_status() -> None:
@@ -3883,9 +6105,10 @@ class RobotDemo(Demo):
             root = current_memories_root()
             stem = _resolve_memory_stem(stem, root)
             bvh_path = _memory_bvh_path(root, stem)
-            csv_path = _memory_csv_path(root, stem)
-            if not bvh_path.is_file() and not csv_path.is_file():
-                raise FileNotFoundError(f"No BVH or T2 CSV found for memory `{stem}`.")
+            t3_csv_path = _memory_t3_csv_path(root, stem)
+            t2_csv_path = _memory_csv_path(root, stem)
+            if not bvh_path.is_file() and not t3_csv_path.is_file() and not t2_csv_path.is_file():
+                raise FileNotFoundError(f"No BVH, T3 CSV, or T2 CSV found for memory `{stem}`.")
             if bvh_path.is_file():
                 load_bvh_memory(bvh_path)
             workflow.output_root = root
@@ -3893,21 +6116,29 @@ class RobotDemo(Demo):
             workflow.real_robot_previewed_memory_stem = stem
             workflow.bvh_path = bvh_path if bvh_path.is_file() else None
             workflow.npz_path = None
-            if csv_path.is_file():
-                load_t2_preview(csv_path, preserve_base_pose=preserve_base_pose)
+            if t3_csv_path.is_file():
+                combined_csv_path_text.value = str(t3_csv_path)
+                load_combined_t3_motion(t3_csv_path, preserve_base_pose=preserve_base_pose)
                 if bvh_path.is_file():
-                    update_status(f"Loaded memory with T2 CSV:\n\n`{stem}`")
+                    update_status(f"Loaded memory with T3 CSV:\n\n`{stem}`")
+                else:
+                    update_status(f"Loaded T3 CSV-only robot memory:\n\n`{stem}`")
+            elif t2_csv_path.is_file():
+                load_t2_preview(t2_csv_path, preserve_base_pose=preserve_base_pose)
+                if bvh_path.is_file():
+                    update_status(f"Loaded memory with fallback T2 CSV:\n\n`{stem}`")
                 else:
                     update_status(f"Loaded T2 CSV-only robot memory:\n\n`{stem}`")
             else:
                 workflow.clear_t2_preview(clear_wheel_base=False)
-                update_status(f"Loaded BVH memory without T2 CSV:\n\n`{stem}`")
-            csv_path_text.value = str(csv_path)
+                update_status(f"Loaded BVH memory without robot CSV:\n\n`{stem}`")
+            csv_path_text.value = str(t2_csv_path)
             output_root_text.value = str(root)
             clip_name_text.value = Path(stem).name
             session = self.client_sessions.get(client.client_id)
             if session is not None:
                 outbound_rack = _outbound_rack_from_memory_stem(stem)
+                pick_request = _pick_request_from_memory_stem(stem)
                 if outbound_rack is not None and session.motions:
                     outbound_motion = next(iter(session.motions.values()))
                     session.human_outbound_rack_poses[outbound_rack] = (
@@ -3916,6 +6147,69 @@ class RobotDemo(Demo):
                     )
                     session.human_route_rack = outbound_rack
                     session.human_route_kind = "outbound"
+                elif pick_request is not None and session.motions:
+                    object_key = (
+                        pick_request.rack_name,
+                        pick_request.shelf_number,
+                        pick_request.object_index,
+                    )
+                    object_position = workflow.rack_object_home_positions.get(object_key)
+                    if object_position is not None:
+                        pick_motion = next(iter(session.motions.values()))
+                        restored_hand_side = "left" if pick_request.object_index == 3 else "right"
+                        restored_hand_label = "Left" if restored_hand_side == "left" else "Right"
+                        restored_hand_names = (
+                            pick_motion.skeleton.left_hand_joint_names
+                            if restored_hand_side == "left"
+                            else pick_motion.skeleton.right_hand_joint_names
+                        )
+                        hand_name = restored_hand_names[0]
+                        hand_index = pick_motion.skeleton.bone_order_names.index(hand_name)
+                        middle_name = (
+                            f"{restored_hand_label}HandMiddleEnd"
+                            if f"{restored_hand_label}HandMiddleEnd" in pick_motion.skeleton.bone_order_names
+                            else restored_hand_names[-1]
+                        )
+                        middle_index = pick_motion.skeleton.bone_order_names.index(middle_name)
+                        attach_frame = min(
+                            pick_motion.length - 1,
+                            max(0, int(round(pick_motion.length * 0.52))),
+                        )
+                        wrist_attach = pick_motion.joints_pos[attach_frame, hand_index].detach().cpu().numpy()
+                        middle_attach = pick_motion.joints_pos[attach_frame, middle_index].detach().cpu().numpy()
+                        palm_attach = 0.35 * wrist_attach + 0.65 * middle_attach
+                        hand_rotation_attach = pick_motion.joints_rot[attach_frame, hand_index].detach().cpu().numpy()
+                        workflow.picked_rack_object = object_key
+                        workflow.picked_rack_objects_by_hand.clear()
+                        workflow.pick_hand_side = restored_hand_side
+                        workflow.pick_hold_start_frame = attach_frame
+                        workflow.pick_hold_start_frames_by_side.clear()
+                        workflow.pick_object_hand_offset = (
+                            hand_rotation_attach.T @ (np.asarray(object_position, dtype=np.float64) - palm_attach)
+                        )
+                        workflow.pick_object_hand_offsets_by_side.clear()
+                        workflow.pick_reach_start_frame = 0
+                        workflow.pick_hand_target_world = None
+                        workflow.pick_target_path_world = None
+                        workflow.pick_grasp_target_world = None
+                        workflow.pick_grasp_verified = True
+                        workflow.pick_elbow_bend_hint_world = None
+                        workflow.place_release_frame = None
+                        workflow.place_object_position_world = None
+                        workflow.place_object_positions_by_hand.clear()
+                        workflow.place_reach_start_frame = None
+                        workflow.place_hand_target_world = None
+                        workflow.place_hand_targets_by_side.clear()
+                        workflow.place_target_path_world = None
+                        workflow.place_target_paths_by_side.clear()
+                        workflow.place_elbow_bend_hint_world = None
+                        workflow.place_elbow_bend_hints_by_side.clear()
+                        session.human_outbound_rack_poses[pick_request.rack_name] = (
+                            pick_motion.joints_pos[0].detach().cpu().numpy().copy(),
+                            pick_motion.joints_rot[0].detach().cpu().numpy().copy(),
+                        )
+                        session.human_route_rack = pick_request.rack_name
+                        session.human_route_kind = "pick_hold"
                 self.set_frame(client.client_id, 0)
                 session.play_once = True
                 session.playing = True
@@ -3955,39 +6249,53 @@ class RobotDemo(Demo):
                 )
                 return
 
-            job = SomaT2RetargetJob(
-                retargeter_root=Path(retargeter_root_text.value).expanduser().resolve(),
-                bvh_path=bvh_path,
-                output_root=output_root,
-                conda_env=str(conda_env_text.value).strip() or "soma-retargeter",
-            )
+            if self.retarget_server_url:
+                relative_stem = self._retarget_relative_stem(bvh_path, output_root)
+                expected_csv_path = output_root / "t2_csv" / relative_stem.with_suffix(".csv")
+                job = None
+            else:
+                job = SomaT2RetargetJob(
+                    retargeter_root=Path(retargeter_root_text.value).expanduser().resolve(),
+                    bvh_path=bvh_path,
+                    output_root=output_root,
+                    conda_env=str(conda_env_text.value).strip() or "soma-retargeter",
+                )
+                relative_stem = job.relative_stem
+                expected_csv_path = job.csv_path
             workflow.retarget_running = True
             set_retarget_buttons_disabled(True)
-            update_status(f"Retargeting `{job.relative_stem}` to `{job.csv_path}`...")
+            update_status(f"Retargeting `{relative_stem}` to `{expected_csv_path}`...")
             retarget_notif = notify_client.add_notification(
                 title="Retargeting started",
-                body="soma-retargeter is running headless.",
+                body="Remote soma-retargeter is running." if self.retarget_server_url else "soma-retargeter is running headless.",
                 loading=True,
                 with_close_button=False,
             )
 
             def run_job() -> None:
                 try:
-                    result = job.run()
-                    log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".retarget.log")
-                    log_path.parent.mkdir(parents=True, exist_ok=True)
-                    log_path.write_text(result.stdout or "", encoding="utf-8")
-                    if result.returncode != 0:
-                        raise RuntimeError(f"soma-retargeter failed with exit code {result.returncode}. Log: {log_path}")
-                    if not job.csv_path.is_file():
-                        raise FileNotFoundError(f"Expected retarget CSV was not created: {job.csv_path}")
+                    if self.retarget_server_url:
+                        retarget_job, log_path = self._run_remote_retarget_bvh_to_csv(bvh_path, output_root)
+                    else:
+                        assert job is not None
+                        result = job.run()
+                        log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".retarget.log")
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                        log_path.write_text(result.stdout or "", encoding="utf-8")
+                        if result.returncode != 0:
+                            raise RuntimeError(f"soma-retargeter failed with exit code {result.returncode}. Log: {log_path}")
+                        if not job.csv_path.is_file():
+                            raise FileNotFoundError(f"Expected retarget CSV was not created: {job.csv_path}")
+                        retarget_job = job
                     workflow.output_root = output_root
-                    workflow.memory_stem = str(job.relative_stem)
+                    workflow.memory_stem = str(retarget_job.relative_stem)
                     workflow.bvh_path = bvh_path
-                    load_memory(str(job.relative_stem))
-                    refresh_memory_options(str(job.relative_stem))
+                    if bvh_path.is_file():
+                        load_bvh_memory(bvh_path)
+                    load_t2_preview(retarget_job.csv_path)
+                    refresh_memory_options(str(retarget_job.relative_stem))
                     retarget_notif.title = "Retargeting finished"
-                    retarget_notif.body = str(job.csv_path)
+                    retarget_notif.body = str(retarget_job.csv_path)
                     retarget_notif.loading = False
                     retarget_notif.with_close_button = True
                     retarget_notif.auto_close_seconds = 5.0
@@ -4020,43 +6328,57 @@ class RobotDemo(Demo):
                 )
                 return
 
-            job = SomaT3RetargetJob(
-                retargeter_root=Path(retargeter_root_text.value).expanduser().resolve(),
-                bvh_path=bvh_path,
-                output_root=output_root,
-                conda_env=str(conda_env_text.value).strip() or "soma-retargeter",
-            )
+            if self.retarget_server_url:
+                relative_stem = self._retarget_relative_stem(bvh_path, output_root)
+                expected_t3_csv_path = output_root / "t3_csv" / relative_stem.with_suffix(".csv")
+                job = None
+            else:
+                job = SomaT3RetargetJob(
+                    retargeter_root=Path(retargeter_root_text.value).expanduser().resolve(),
+                    bvh_path=bvh_path,
+                    output_root=output_root,
+                    conda_env=str(conda_env_text.value).strip() or "soma-retargeter",
+                )
+                relative_stem = job.relative_stem
+                expected_t3_csv_path = job.t3_csv_path
             workflow.retarget_running = True
             set_retarget_buttons_disabled(True)
-            update_status(f"Retargeting `{job.relative_stem}` to T3 CSV `{job.t3_csv_path}`...")
+            update_status(f"Retargeting `{relative_stem}` to T3 CSV `{expected_t3_csv_path}`...")
             retarget_notif = notify_client.add_notification(
                 title="T3 retargeting started",
-                body="soma-retargeter bvh_to_t3 is running headless.",
+                body="Remote soma-retargeter bvh_to_t3 is running."
+                if self.retarget_server_url
+                else "soma-retargeter bvh_to_t3 is running headless.",
                 loading=True,
                 with_close_button=False,
             )
 
             def run_job() -> None:
                 try:
-                    result = job.run()
-                    log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".t3_retarget.log")
-                    log_path.parent.mkdir(parents=True, exist_ok=True)
-                    log_path.write_text(result.stdout or "", encoding="utf-8")
-                    if result.returncode != 0:
-                        raise RuntimeError(f"T3 retargeter failed with exit code {result.returncode}. Log: {log_path}")
-                    if not job.t3_csv_path.is_file():
-                        raise FileNotFoundError(f"Expected T3 CSV was not created: {job.t3_csv_path}")
-                    if not job.wheel_csv_path.is_file():
-                        raise FileNotFoundError(f"Expected T3 wheel CSV was not created: {job.wheel_csv_path}")
+                    if self.retarget_server_url:
+                        retarget_job, log_path = self._run_remote_retarget_bvh_to_t3_csv(bvh_path, output_root)
+                    else:
+                        assert job is not None
+                        result = job.run()
+                        log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".t3_retarget.log")
+                        log_path.parent.mkdir(parents=True, exist_ok=True)
+                        log_path.write_text(result.stdout or "", encoding="utf-8")
+                        if result.returncode != 0:
+                            raise RuntimeError(f"T3 retargeter failed with exit code {result.returncode}. Log: {log_path}")
+                        if not job.t3_csv_path.is_file():
+                            raise FileNotFoundError(f"Expected T3 CSV was not created: {job.t3_csv_path}")
+                        if not job.wheel_csv_path.is_file():
+                            raise FileNotFoundError(f"Expected T3 wheel CSV was not created: {job.wheel_csv_path}")
+                        retarget_job = job
                     workflow.output_root = output_root
-                    workflow.memory_stem = str(job.relative_stem)
+                    workflow.memory_stem = str(retarget_job.relative_stem)
                     workflow.bvh_path = bvh_path
                     load_bvh_memory(bvh_path)
-                    combined_csv_path_text.value = str(job.t3_csv_path)
-                    load_combined_t3_motion(job.t3_csv_path)
-                    refresh_memory_options(str(job.relative_stem))
+                    combined_csv_path_text.value = str(retarget_job.t3_csv_path)
+                    load_combined_t3_motion(retarget_job.t3_csv_path)
+                    refresh_memory_options(str(retarget_job.relative_stem))
                     retarget_notif.title = "T3 retargeting finished"
-                    retarget_notif.body = str(job.t3_csv_path)
+                    retarget_notif.body = str(retarget_job.t3_csv_path)
                     retarget_notif.loading = False
                     retarget_notif.with_close_button = True
                     retarget_notif.auto_close_seconds = 5.0
@@ -4237,6 +6559,15 @@ class RobotDemo(Demo):
                 f"Loaded `{csv_path.name}`: `{session.max_frame_idx + 1}` synchronized rows at `{fps:.2f} Hz`.\n\n"
                 "T3 preview, TaraBase RPM, and both arms now share the same frame clock."
             )
+
+        def play_loaded_motion_once() -> None:
+            session = self.client_sessions[client.client_id]
+            workflow.stream_real_robot_playback = False
+            workflow.real_robot_approval_pending = False
+            workflow.tara_stop_event.set()
+            self.set_frame(client.client_id, 0)
+            session.play_once = True
+            session.playing = True
 
         def load_base_memory(stem: str, *, chain: bool | None = None) -> None:
             root = current_memories_root()
@@ -4561,21 +6892,28 @@ class RobotDemo(Demo):
                 current["updated_at"] = time.time()
                 self._control_jobs[job_id] = current
 
-        def run_retarget_bvh_to_memory_csv_sync(bvh_path: Path, output_root: Path) -> tuple[SomaT2RetargetJob, Path]:
-            job = SomaT2RetargetJob(
+        def run_retarget_bvh_to_t3_memory_csv_sync(
+            bvh_path: Path,
+            output_root: Path,
+        ) -> tuple[SomaT3RetargetJob | RemoteT3RetargetJob, Path]:
+            if self.retarget_server_url:
+                return self._run_remote_retarget_bvh_to_t3_csv(bvh_path, output_root)
+            job = SomaT3RetargetJob(
                 retargeter_root=Path(retargeter_root_text.value).expanduser().resolve(),
                 bvh_path=bvh_path,
                 output_root=output_root,
                 conda_env=str(conda_env_text.value).strip() or "soma-retargeter",
             )
             result = job.run()
-            log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".retarget.log")
+            log_path = job.output_root / "logs" / job.relative_stem.with_suffix(".t3_retarget.log")
             log_path.parent.mkdir(parents=True, exist_ok=True)
             log_path.write_text(result.stdout or "", encoding="utf-8")
             if result.returncode != 0:
-                raise RuntimeError(f"soma-retargeter failed with exit code {result.returncode}. Log: {log_path}")
-            if not job.csv_path.is_file():
-                raise FileNotFoundError(f"Expected retarget CSV was not created: {job.csv_path}")
+                raise RuntimeError(f"T3 retargeter failed with exit code {result.returncode}. Log: {log_path}")
+            if not job.t3_csv_path.is_file():
+                raise FileNotFoundError(f"Expected T3 CSV was not created: {job.t3_csv_path}")
+            if not job.wheel_csv_path.is_file():
+                raise FileNotFoundError(f"Expected T3 wheel CSV was not created: {job.wheel_csv_path}")
             return job, log_path
 
         def generate_save_retarget_from_control_api(payload: dict[str, object]) -> dict[str, object]:
@@ -4593,7 +6931,7 @@ class RobotDemo(Demo):
             if "soma" not in session.model_name.lower():
                 raise ValueError("Generate-retarget requires a SOMA model. Select a Kimodo-SOMA model first.")
             duration = float(payload.get("duration_seconds") or session.cur_duration or DEFAULT_CUR_DURATION)
-            duration = max(0.1, duration)
+            duration = max(0.1, _resolve_generate_duration_seconds(prompts, duration, float(session.model_fps)))
             seed = int(payload.get("seed") or 42)
             diffusion_steps = int(payload.get("diffusion_steps") or 100)
             stem = str(payload.get("stem") or "").strip() or _new_generated_stem()
@@ -4635,7 +6973,7 @@ class RobotDemo(Demo):
                 "- [x] Queued\n"
                 "- [ ] Generate SOMA motion\n"
                 "- [ ] Save memory\n"
-                "- [ ] Retarget to T2\n"
+                "- [ ] Retarget to T3\n"
                 "- [ ] Load result"
             )
             progress_notif = client.add_notification(
@@ -4685,7 +7023,7 @@ class RobotDemo(Demo):
                             "- [x] Queued",
                             "- [x] Generate SOMA motion",
                             "- [ ] Save memory",
-                            "- [ ] Retarget to T2",
+                            "- [ ] Retarget to T3",
                             "- [ ] Load result",
                         ],
                     )
@@ -4717,7 +7055,7 @@ class RobotDemo(Demo):
                             "- [x] Queued",
                             "- [x] Generate SOMA motion",
                             "- [x] Save memory",
-                            "- [ ] Retarget to T2",
+                            "- [ ] Retarget to T3",
                             "- [ ] Load result",
                         ],
                     )
@@ -4729,43 +7067,53 @@ class RobotDemo(Demo):
                     refresh_memory_options(stem)
 
                     show_control_stage(
-                        "Retargeting to T2 robot",
+                        "Retargeting to T3 robot",
                         f"BVH: `{bvh_path}`",
                         "retargeting",
                         [
                             "- [x] Queued",
                             "- [x] Generate SOMA motion",
                             "- [x] Save memory",
-                            "- [x] Retarget to T2",
+                            "- [x] Retarget to T3",
                             "- [ ] Load result",
                         ],
                         bvh_path=str(bvh_path),
+                        retarget_target="t3",
                     )
-                    retarget_job, log_path = run_retarget_bvh_to_memory_csv_sync(bvh_path, output_root)
+                    retarget_job, log_path = run_retarget_bvh_to_t3_memory_csv_sync(bvh_path, output_root)
                     workflow.output_root = output_root
                     workflow.memory_stem = str(retarget_job.relative_stem)
                     workflow.bvh_path = bvh_path
-                    load_memory(str(retarget_job.relative_stem))
+                    load_bvh_memory(bvh_path)
+                    combined_csv_path_text.value = str(retarget_job.t3_csv_path)
+                    load_combined_t3_motion(retarget_job.t3_csv_path)
+                    play_loaded_motion_once()
                     refresh_memory_options(str(retarget_job.relative_stem))
                     show_control_stage(
                         "Prompt-to-robot complete",
-                        "Generated memory is loaded in Viser and ready for playback.\n\n"
+                        "Generated T3 motion is loaded in Viser and playing exactly once.\n\n"
                         f"Stem: `{retarget_job.relative_stem}`\n\n"
                         f"BVH: `{bvh_path}`\n\n"
-                        f"T2 CSV: `{retarget_job.csv_path}`\n\n"
+                        f"T3 CSV: `{retarget_job.t3_csv_path}`\n\n"
+                        f"Wheel CSV: `{retarget_job.wheel_csv_path}`\n\n"
                         f"Log: `{log_path}`",
                         "done",
                         [
                             "- [x] Queued",
                             "- [x] Generate SOMA motion",
                             "- [x] Save memory",
-                            "- [x] Retarget to T2",
+                            "- [x] Retarget to T3",
                             "- [x] Load result",
                         ],
                         stem=str(retarget_job.relative_stem),
                         bvh_path=str(bvh_path),
-                        csv_path=str(retarget_job.csv_path),
+                        csv_path=str(retarget_job.t3_csv_path),
+                        t3_csv_path=str(retarget_job.t3_csv_path),
+                        wheel_csv_path=str(retarget_job.wheel_csv_path),
                         log_path=str(log_path),
+                        retarget_target="t3",
+                        playback_started=True,
+                        playback_mode="viser_once",
                     )
                     progress_notif.loading = False
                     progress_notif.with_close_button = True
@@ -4780,7 +7128,7 @@ class RobotDemo(Demo):
                             "- [x] Queued",
                             "- [ ] Generate SOMA motion",
                             "- [ ] Save memory",
-                            "- [ ] Retarget to T2",
+                            "- [ ] Retarget to T3",
                             "- [ ] Load result",
                         ],
                         error=str(exc),
@@ -5789,6 +8137,11 @@ def main() -> None:
         help="Optional FastAPI Kimodo model server URL. If set, the Viser UI sends generation requests remotely.",
     )
     parser.add_argument(
+        "--retarget-server-url",
+        default=os.environ.get("KIMODO_RETARGET_SERVER_URL"),
+        help="Optional FastAPI soma-retargeter server URL. If set, BVH retargeting runs remotely.",
+    )
+    parser.add_argument(
         "--world-scene-path",
         default=os.environ.get("KIMODO_WORLD_SCENE_PATH", str(DEFAULT_WORLD_SCENE_PATH)),
         help="Optional world PLY to load into the Viser scene without changing the human or robot meshes.",
@@ -5841,10 +8194,14 @@ def main() -> None:
             tara_rpm_scale=args.tara_rpm_scale,
             tara_debug=args.tara_debug,
             model_server_url=args.model_server_url,
+            retarget_server_url=args.retarget_server_url,
         )
     except Exception:
         raise SystemExit(_text_encoder_startup_error(text_encoder_mode)) from None
-    demo.start_control_server(args.control_host, args.control_port)
+    try:
+        demo.start_control_server(args.control_host, args.control_port)
+    except RuntimeError as exc:
+        raise SystemExit(str(exc)) from None
     demo.run()
 
 

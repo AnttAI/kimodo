@@ -49,7 +49,7 @@ python skills/load-memory/scripts/load_memory.py load generated/kimodo_b8557cb50
 1. Send the requested text, dropdown label, or generated stem to the controller without local alias mapping.
 2. Read the controller URL from `KIMODO_CONTROL_URL`, `--controller-url`, or the plugin config.
 3. POST the memory request to `/load-memory`.
-4. The app-side handler searches each connected client's memory root, loads the BVH/T2 preview into connected browser sessions, and starts playback.
+4. The app-side handler searches each connected client's memory root, loads the BVH/T3 preview into connected browser sessions, falls back to T2 only when no T3 CSV exists, and starts playback.
 5. Report the exact loaded stem or exact failure.
 
 ## Codex CLI Requirement

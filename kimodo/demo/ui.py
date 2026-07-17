@@ -949,6 +949,9 @@ def create_gui(
 
                 # Reset to frame 0
                 demo.set_frame(client.client_id, 0)
+                restore_robot_state = getattr(demo, "restore_robot_memory_state_from_loaded_motion", None)
+                if callable(restore_robot_state):
+                    restore_robot_state(client, str(load_path))
 
             @gui_load_motion_button.on_click
             def _(event: viser.GuiEvent) -> None:
