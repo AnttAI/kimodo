@@ -880,29 +880,71 @@
     <child link="left_base_link" />
     <origin xyz="0.00197790 0.07684000 0.35792000" rpy="1.5707963267948966 -1.5707963267948966 3.141592653589793" />
     </joint>
-  <link name="waist_connector_link">
-    <visual name="waist_connector">
-      <origin xyz="0.00150990 0.00000000 0.62098742" rpy="0 0 0" />
+  <link name="telescopic_lift_base_link">
+    <visual name="telescopic_lift_outer_square_sleeve">
+      <origin xyz="0 0 0.495" rpy="0 0 0" />
       <geometry>
-        <mesh filename="meshes/waist_connector.stl" />
+        <box size="0.09 0.09 0.60" />
         </geometry>
       <material name="connector_graphite" />
       </visual>
-    <collision>
-      <origin xyz="0.00150990 0.00000000 0.62098742" rpy="0 0 0" />
+    <visual name="telescopic_lift_base_plate">
+      <origin xyz="0 0 0.195" rpy="0 0 0" />
       <geometry>
-        <box size="0.075 0.075 0.76597484" />
+        <box size="0.16 0.16 0.02" />
+        </geometry>
+      <material name="bumper_black" />
+      </visual>
+    <collision>
+      <origin xyz="0 0 0.495" rpy="0 0 0" />
+      <geometry>
+        <box size="0.10 0.10 0.60" />
+        </geometry>
+      </collision>
+    <collision>
+      <origin xyz="0 0 0.195" rpy="0 0 0" />
+      <geometry>
+        <box size="0.16 0.16 0.02" />
         </geometry>
       </collision>
     </link>
-  <joint name="base_to_waist_connector" type="fixed">
+  <link name="telescopic_lift_carriage_link">
+    <visual name="telescopic_lift_inner_square_stage">
+      <origin xyz="0 0 -0.275" rpy="0 0 0" />
+      <geometry>
+        <box size="0.07 0.07 0.55" />
+        </geometry>
+      <material name="rim_metal" />
+      </visual>
+    <visual name="telescopic_lift_top_plate">
+      <origin xyz="0 0 -0.01" rpy="0 0 0" />
+      <geometry>
+        <box size="0.13 0.13 0.02" />
+        </geometry>
+      <material name="bumper_black" />
+      </visual>
+    <collision>
+      <origin xyz="0 0 -0.275" rpy="0 0 0" />
+      <geometry>
+        <box size="0.08 0.08 0.55" />
+        </geometry>
+      </collision>
+    </link>
+  <joint name="base_to_telescopic_lift" type="fixed">
     <parent link="base_link" />
-    <child link="waist_connector_link" />
+    <child link="telescopic_lift_base_link" />
     <origin xyz="0 0 0" rpy="0 0 0" />
     </joint>
-  <joint name="waist_connector_to_waist_yaw" type="fixed">
-    <parent link="waist_connector_link" />
+  <joint name="telescopic_lift_joint" type="prismatic">
+    <parent link="telescopic_lift_base_link" />
+    <child link="telescopic_lift_carriage_link" />
+    <origin xyz="0 0 0.795" rpy="0 0 0" />
+    <axis xyz="0 0 1" />
+    <limit lower="0" upper="0.55" effort="1000" velocity="0.25" />
+    </joint>
+  <joint name="telescopic_lift_to_waist_yaw" type="fixed">
+    <parent link="telescopic_lift_carriage_link" />
     <child link="waist_yaw_link" />
-    <origin xyz="0.00150990 0.00000000 1.00397484" rpy="0 0 0" />
+    <origin xyz="0 0 0" rpy="0 0 0" />
     </joint>
   </robot>

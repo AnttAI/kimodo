@@ -31,6 +31,8 @@ class RackPickRequest:
     rack_name: str
     object_index: int
     shelf_number: int = 4
+    target_height_m: float | None = None
+    hip_height_m: float | None = None
 
 
 def cardinal_rack_route_required_seconds(
@@ -151,7 +153,34 @@ def requested_rack_pick(prompts: Sequence[str]) -> RackPickRequest | None:
         raise ValueError("Rack object number must be 1, 2, or 3")
     if shelf_number not in {1, 2, 3, 4, 5}:
         raise ValueError("Rack shelf number must be 1, 2, 3, 4, or 5")
-    return RackPickRequest(rack_name, object_index, shelf_number)
+    hip_height_match = re.search(
+        r"\b(?:hip|hips|pelvis)\s*(?:at|to|height)?\s*"
+        r"(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters|m|meter|meters)\b",
+        prompt,
+        re.IGNORECASE,
+    )
+    hip_height_m = None
+    if hip_height_match is not None:
+        value = float(hip_height_match.group(1))
+        unit = hip_height_match.group(2).lower()
+        hip_height_m = value / 100.0 if unit.startswith(("cm", "centimeter")) else value
+        if not 0.15 <= hip_height_m <= 1.20:
+            raise ValueError("Rack pick hip height must be between 15 cm and 1.2 m")
+
+    height_match = None if hip_height_match is not None else re.search(
+        r"\b(?:at|height|target|shelf\s+height)\s*"
+        r"(\d+(?:\.\d+)?)\s*(cm|centimeter|centimeters|m|meter|meters)\b",
+        prompt,
+        re.IGNORECASE,
+    )
+    target_height_m = None
+    if height_match is not None:
+        value = float(height_match.group(1))
+        unit = height_match.group(2).lower()
+        target_height_m = value / 100.0 if unit.startswith(("cm", "centimeter")) else value
+        if not 0.05 <= target_height_m <= 1.50:
+            raise ValueError("Rack pick target height must be between 5 cm and 1.5 m")
+    return RackPickRequest(rack_name, object_index, shelf_number, target_height_m, hip_height_m)
 
 
 def rack_shelf_object_position(

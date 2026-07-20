@@ -47,6 +47,33 @@ class RackMotionPlannerTest(unittest.TestCase):
         self.assertEqual(request.rack_name, "rack_3")
         self.assertEqual(request.object_index, 2)
         self.assertEqual(request.shelf_number, 4)
+        self.assertIsNone(request.target_height_m)
+
+    def test_parses_pick_prompt_with_centimeter_target_height(self):
+        request = requested_rack_pick(["pick object 1 from rack 1 shelf 1 at 30 cm"])
+        self.assertIsNotNone(request)
+        self.assertEqual(request.rack_name, "rack_1")
+        self.assertEqual(request.object_index, 1)
+        self.assertEqual(request.shelf_number, 1)
+        self.assertAlmostEqual(request.target_height_m, 0.30)
+
+    def test_parses_pick_prompt_with_centimeter_hip_height(self):
+        request = requested_rack_pick(["pick object 1 from rack 1 shelf 1 hip at 20 cm"])
+        self.assertIsNotNone(request)
+        self.assertEqual(request.rack_name, "rack_1")
+        self.assertEqual(request.object_index, 1)
+        self.assertEqual(request.shelf_number, 1)
+        self.assertIsNone(request.target_height_m)
+        self.assertAlmostEqual(request.hip_height_m, 0.20)
+
+    def test_parses_pick_prompt_with_midrange_centimeter_hip_height(self):
+        request = requested_rack_pick(["pick object 1 from rack 1 shelf 1 hip at 70 cm"])
+        self.assertIsNotNone(request)
+        self.assertEqual(request.rack_name, "rack_1")
+        self.assertEqual(request.object_index, 1)
+        self.assertEqual(request.shelf_number, 1)
+        self.assertIsNone(request.target_height_m)
+        self.assertAlmostEqual(request.hip_height_m, 0.70)
 
     def test_three_shelf_objects_are_15cm_apart_and_5cm_inside_front(self):
         positions = [

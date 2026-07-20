@@ -510,6 +510,184 @@ def _freeze_body_except_arm_sides(
     motion.joints_pos = solved_positions
 
 
+def _solve_two_bone_chain_global(
+    *,
+    positions: np.ndarray,
+    global_rotations: np.ndarray,
+    frame: int,
+    root_idx: int,
+    mid_idx: int,
+    end_idx: int,
+    target_world: np.ndarray,
+    bend_hint_world: np.ndarray,
+) -> None:
+    root = positions[frame, root_idx]
+    mid = positions[frame, mid_idx]
+    end = positions[frame, end_idx]
+    upper = mid - root
+    lower = end - mid
+    upper_length = float(np.linalg.norm(upper))
+    lower_length = float(np.linalg.norm(lower))
+    root_to_target = np.asarray(target_world, dtype=np.float64) - root
+    distance = float(np.linalg.norm(root_to_target))
+    if upper_length < 1e-6 or lower_length < 1e-6 or distance < 1e-6:
+        return
+
+    max_reach = max(1e-6, upper_length + lower_length - 1e-4)
+    min_reach = max(1e-6, abs(upper_length - lower_length) + 1e-4)
+    distance = min(max(distance, min_reach), max_reach)
+    direction = root_to_target / max(float(np.linalg.norm(root_to_target)), 1e-9)
+    along = (upper_length**2 - lower_length**2 + distance**2) / (2.0 * distance)
+    height = np.sqrt(max(upper_length**2 - along**2, 0.0))
+    bend = np.asarray(bend_hint_world, dtype=np.float64)
+    bend = bend - np.dot(bend, direction) * direction
+    if np.linalg.norm(bend) < 1e-6:
+        bend = mid - (root + np.dot(mid - root, direction) * direction)
+    if np.linalg.norm(bend) < 1e-6:
+        bend = np.cross(direction, np.array([0.0, 0.0, 1.0]))
+    if np.linalg.norm(bend) < 1e-6:
+        bend = np.cross(direction, np.array([1.0, 0.0, 0.0]))
+    bend /= max(float(np.linalg.norm(bend)), 1e-9)
+
+    solved_mid = root + along * direction + height * bend
+    solved_end = root + distance * direction
+    upper_delta = _rotation_between_vectors(upper, solved_mid - root)
+    lower_delta = _rotation_between_vectors(lower, solved_end - solved_mid)
+    global_rotations[frame, root_idx] = upper_delta @ global_rotations[frame, root_idx]
+    global_rotations[frame, mid_idx] = lower_delta @ global_rotations[frame, mid_idx]
+
+
+def _apply_low_pick_squat_pose(
+    motion,
+    base_global_rotations: np.ndarray,
+    base_joint_positions: np.ndarray,
+    base_root_position: np.ndarray,
+    active_arm_sides: set[str],
+    target_height_m: float | None,
+    target_hip_height_m: float | None,
+    lower_end_frame: int,
+    forward_hint_world: np.ndarray | None = None,
+) -> None:
+    """Lower the body with planted feet for low shelf picks before arm IK."""
+    if target_height_m is None and target_hip_height_m is None:
+        return
+    if target_height_m is not None and target_height_m > 0.45 and target_hip_height_m is None:
+        return
+    skeleton = motion.skeleton
+    names = skeleton.bone_order_names
+    required = {"LeftLeg", "LeftShin", "LeftFoot", "RightLeg", "RightShin", "RightFoot"}
+    if not required <= set(names):
+        return
+
+    device = motion.joints_rot.device
+    dtype = motion.joints_rot.dtype
+    base_global = torch.as_tensor(base_global_rotations, device=device, dtype=dtype)
+    base_local = global_rots_to_local_rots(base_global, skeleton)
+    local_rotations = global_rots_to_local_rots(motion.joints_rot, skeleton)
+
+    moving_names: set[str] = set()
+    for side in active_arm_sides:
+        prefix = "Left" if side == "left" else "Right"
+        moving_names.update({f"{prefix}Shoulder", f"{prefix}Arm", f"{prefix}ForeArm"})
+
+    leg_names = {"LeftLeg", "LeftShin", "LeftFoot", "LeftToeBase", "RightLeg", "RightShin", "RightFoot", "RightToeBase"}
+    spine_names = {"Spine1", "Spine2", "Chest", "Neck1", "Neck2", "Head", "HeadEnd", "Jaw", "LeftEye", "RightEye"}
+    for joint_index, joint_name in enumerate(names):
+        if joint_name not in moving_names and joint_name not in leg_names:
+            local_rotations[:, joint_index] = base_local[joint_index]
+        if joint_name in spine_names:
+            local_rotations[:, joint_index] = base_local[joint_index]
+
+    root_positions = torch.as_tensor(base_root_position, device=device, dtype=dtype)[None].repeat(
+        motion.length,
+        1,
+    )
+    effective_height = float(target_hip_height_m if target_hip_height_m is not None else target_height_m)
+    ultra_low_pick = effective_height <= 0.20
+    # Extremely deep analytic leg IK can make the skinned SOMA mesh explode.
+    # Keep ultra-low picks as a stable crouch/reach visualization instead of a
+    # physically exact planted-foot solution.
+    if target_hip_height_m is not None:
+        standing_hip_height = float(base_root_position[1])
+        squat_depth = float(np.clip(standing_hip_height - float(target_hip_height_m), 0.0, 0.55))
+    else:
+        squat_depth = float(np.clip(0.46 - float(target_height_m), 0.18, 0.30 if ultra_low_pick else 0.55))
+    lower_end_frame = max(1, min(int(lower_end_frame), motion.length - 1))
+    low_hold_end = min(motion.length - 1, max(lower_end_frame + 1, int(round(motion.length * 0.72))))
+    knee_bend_axis = np.array([1.0, 0.0, 0.0], dtype=np.float64)
+    max_hip_bend = np.deg2rad(16.0)
+    max_knee_bend = np.deg2rad(38.0)
+    max_ankle_bend = np.deg2rad(-12.0)
+    leg_bend_joints = {
+        "LeftLeg": max_hip_bend,
+        "RightLeg": max_hip_bend,
+        "LeftShin": max_knee_bend,
+        "RightShin": max_knee_bend,
+        "LeftFoot": max_ankle_bend,
+        "RightFoot": max_ankle_bend,
+    }
+    for frame in range(motion.length):
+        if frame <= lower_end_frame:
+            progress = frame / max(1, lower_end_frame)
+            hold = progress * progress * (3.0 - 2.0 * progress)
+        elif frame <= low_hold_end:
+            hold = 1.0
+        else:
+            progress = (frame - low_hold_end) / max(1, motion.length - 1 - low_hold_end)
+            ease = progress * progress * (3.0 - 2.0 * progress)
+            return_amount = 1.0 if target_hip_height_m is not None else 0.65
+            hold = 1.0 - return_amount * ease
+        root_positions[frame, 1] -= squat_depth * hold
+        if not ultra_low_pick:
+            for joint_name, max_angle in leg_bend_joints.items():
+                if joint_name in names:
+                    joint_index = names.index(joint_name)
+                    bend_rotation = _rotation_from_axis_angle(knee_bend_axis, hold * max_angle)
+                    local_rotations[frame, joint_index] = torch.as_tensor(
+                        bend_rotation,
+                        device=device,
+                        dtype=dtype,
+                    ) @ base_local[joint_index]
+
+    solved_global, solved_positions, _ = skeleton.fk(local_rotations, root_positions)
+    if ultra_low_pick:
+        positions = solved_positions.detach().cpu().numpy().copy()
+        global_rotations = solved_global.detach().cpu().numpy().copy()
+        base_joint_positions = np.asarray(base_joint_positions, dtype=np.float64)
+        forward_hint = (
+            np.asarray(forward_hint_world, dtype=np.float64)
+            if forward_hint_world is not None
+            else np.array([0.0, 0.0, 1.0], dtype=np.float64)
+        )
+        forward_hint[1] = 0.0
+        forward_hint /= max(float(np.linalg.norm(forward_hint)), 1e-9)
+        knee_hint = forward_hint + np.array([0.0, -0.15, 0.0], dtype=np.float64)
+
+        for side in ("Left", "Right"):
+            hip_idx = names.index(f"{side}Leg")
+            knee_idx = names.index(f"{side}Shin")
+            foot_idx = names.index(f"{side}Foot")
+            foot_target = base_joint_positions[foot_idx].copy()
+            for frame in range(motion.length):
+                _solve_two_bone_chain_global(
+                    positions=positions,
+                    global_rotations=global_rotations,
+                    frame=frame,
+                    root_idx=hip_idx,
+                    mid_idx=knee_idx,
+                    end_idx=foot_idx,
+                    target_world=foot_target,
+                    bend_hint_world=knee_hint,
+                )
+
+        adjusted_global = torch.as_tensor(global_rotations, device=device, dtype=dtype)
+        local_rotations = global_rots_to_local_rots(adjusted_global, skeleton)
+        solved_global, solved_positions, _ = skeleton.fk(local_rotations, root_positions)
+    motion.joints_local_rot = local_rotations
+    motion.joints_rot = solved_global
+    motion.joints_pos = solved_positions
+
+
 def _hold_right_arm_local_pose(motion, hold_global_rotations: np.ndarray, side: str = "right") -> None:
     """Keep the carried object pose fixed relative to the moving body."""
     if side not in {"left", "right"}:
@@ -598,6 +776,9 @@ def _add_rack_to_scene(
                         [0.0, surface_height + 0.08, RACK_DEPTH_M / 2.0 + 0.03],
                         dtype=np.float64,
                     ),
+                    font_size_mode="screen",
+                    font_screen_scale=0.45,
+                    anchor="center-center",
                 )
             )
 
@@ -606,6 +787,9 @@ def _add_rack_to_scene(
             f"{root}/label",
             text=name.replace("_", " ").title(),
             position=np.array([0.0, RACK_HEIGHT_M + 0.08, 0.0], dtype=np.float64),
+            font_size_mode="screen",
+            font_screen_scale=0.55,
+            anchor="center-center",
         )
     )
     return handles
@@ -3375,6 +3559,7 @@ class RobotDemo(Demo):
         model_pick_target_palm_normals: np.ndarray | None = None
         model_pick_palm_normal_local: np.ndarray | None = None
         model_pick_hand_side: str = "right"
+        model_pick_lower_end_frame: int = 0
         model_dual_pick_specs: dict[str, dict[str, object]] | None = None
         model_pick_existing_objects_by_hand: dict[str, tuple[str, int, int]] = {}
         model_pick_existing_offsets_by_hand: dict[str, np.ndarray] = {}
@@ -3703,6 +3888,8 @@ class RobotDemo(Demo):
             if requested_rack_transfer is not None or requested_dual_pick is not None
             else requested_rack_pick(prompts)
         )
+        target_height_m: float | None = None
+        target_hip_height_m: float | None = None
         requested_human_place = (
             False
             if requested_dual_pick is not None or requested_human_pick is not None
@@ -3729,6 +3916,8 @@ class RobotDemo(Demo):
             is_dual_pick = requested_dual_pick is not None
             pick_rack = requested_dual_pick.rack_name if is_dual_pick else requested_human_pick.rack_name
             shelf_number = requested_dual_pick.shelf_number if is_dual_pick else requested_human_pick.shelf_number
+            target_height_m = None if is_dual_pick else requested_human_pick.target_height_m
+            target_hip_height_m = None if is_dual_pick else requested_human_pick.hip_height_m
             pick_object_indices = requested_dual_pick.object_indices if is_dual_pick else (requested_human_pick.object_index,)
             if pick_rack not in RACK_MAP_POSITIONS:
                 raise ValueError(f"Unknown warehouse rack {pick_rack.replace('_', ' ')}")
@@ -3807,6 +3996,22 @@ class RobotDemo(Demo):
             for object_index in pick_object_indices:
                 object_key = (pick_rack, shelf_number, object_index)
                 object_world_position = workflow.rack_object_home_positions.get(object_key)
+                if target_height_m is not None:
+                    object_world_position = np.asarray(
+                        rack_shelf_object_position(
+                            RACK_MAP_POSITIONS[pick_rack],
+                            RACK_MAP_YAWS_RAD.get(pick_rack, 0.0),
+                            float(target_height_m),
+                            object_index,
+                            face_normal_half_extent_m=RACK_WIDTH_M / 2.0,
+                            object_height_m=RACK_PICK_OBJECT_SIZE_M,
+                        ),
+                        dtype=np.float64,
+                    )
+                    workflow.rack_object_home_positions[object_key] = object_world_position.copy()
+                    handle = workflow.rack_object_handles.get(object_key)
+                    if handle is not None:
+                        handle.position = object_world_position
                 if object_world_position is None:
                     raise RuntimeError(
                         f"Shelf {shelf_number} object {object_index} on {pick_rack} is unavailable."
@@ -3817,7 +4022,6 @@ class RobotDemo(Demo):
             last_positions_world, last_rotations = cached_outbound_pose
             last_positions_world = np.asarray(last_positions_world, dtype=np.float64).copy()
             last_rotations = np.asarray(last_rotations, dtype=np.float64).copy()
-            model_pick_base_pose = (last_positions_world, last_rotations)
             world_offset = np.asarray(rack_target, dtype=np.float64)
 
             root_constraint = session.constraints.get("2D Root")
@@ -3833,6 +4037,16 @@ class RobotDemo(Demo):
                 total_frames,
                 axis=0,
             )
+            if (target_height_m is not None and float(target_height_m) <= 0.12) or (
+                target_hip_height_m is not None and float(target_hip_height_m) <= 0.25
+            ):
+                ultra_low_backoff = 0.22 * np.array(
+                    [np.sin(rack_facing_heading), 0.0, np.cos(rack_facing_heading)],
+                    dtype=np.float64,
+                )
+                stationary_root = stationary_root - ultra_low_backoff[None, :]
+                last_positions_world = last_positions_world - ultra_low_backoff[None, :]
+            model_pick_base_pose = (last_positions_world, last_rotations)
             root_constraint.set_smooth_path(False)
             root_constraint.add_interval(
                 f"auto_{pick_rack}_pick_root",
@@ -3851,19 +4065,32 @@ class RobotDemo(Demo):
                 np.repeat(last_rotations[None, ...], initial_pose_frames, axis=0),
             )
 
-            reach_start_frame = 0
             hand_positions = np.repeat(last_positions_world[None, ...], total_frames, axis=0)
             hand_rotations = np.repeat(last_rotations[None, ...], total_frames, axis=0)
             last_frame = total_frames - 1
-            pregrasp_frame = max(1, int(round(last_frame * 0.38)))
-            grasp_frame = max(pregrasp_frame + 1, int(round(last_frame * 0.52)))
+            low_pick_needs_squat = (
+                (target_height_m is not None and float(target_height_m) <= 0.45)
+                or target_hip_height_m is not None
+            )
+            ultra_low_pick = (
+                (target_height_m is not None and float(target_height_m) <= 0.12)
+                or (target_hip_height_m is not None and float(target_hip_height_m) <= 0.25)
+            )
+            lower_end_frame = max(1, int(round(last_frame * (0.44 if ultra_low_pick else 0.34)))) if low_pick_needs_squat else 0
+            reach_start_frame = lower_end_frame if low_pick_needs_squat else 0
+            pregrasp_ratio = 0.58 if ultra_low_pick else (0.52 if low_pick_needs_squat else 0.38)
+            grasp_ratio = 0.74 if ultra_low_pick else (0.68 if low_pick_needs_squat else 0.52)
+            lift_ratio = 0.84 if ultra_low_pick else (0.78 if low_pick_needs_squat else 0.64)
+            chest_ratio = 0.96 if ultra_low_pick else (0.92 if low_pick_needs_squat else 0.84)
+            pregrasp_frame = max(reach_start_frame + 1, int(round(last_frame * pregrasp_ratio)))
+            grasp_frame = max(pregrasp_frame + 1, int(round(last_frame * grasp_ratio)))
             approach_frame = max(
                 pregrasp_frame + 1,
                 int(round((pregrasp_frame + grasp_frame) * 0.5)),
             )
             approach_frame = min(approach_frame, grasp_frame - 1)
-            lift_frame = max(grasp_frame + 1, int(round(last_frame * 0.64)))
-            chest_frame = max(lift_frame + 1, int(round(last_frame * 0.84)))
+            lift_frame = max(grasp_frame + 1, int(round(last_frame * lift_ratio)))
+            chest_frame = max(lift_frame + 1, int(round(last_frame * chest_ratio)))
             chest_frame = min(chest_frame, last_frame)
             rack_yaw = RACK_MAP_YAWS_RAD.get(pick_rack, 0.0)
             outward_normal = np.asarray(
@@ -3885,9 +4112,9 @@ class RobotDemo(Demo):
             # toward the active hand side, and 5 cm higher for shelf/rack
             # clearance. This lets the hand approach like an open gripper
             # coming from the side, instead of pushing the item from the front.
-            approach_clearance = 0.11
-            pregrasp_clearance = 0.07
-            lateral_clearance = 0.12
+            approach_clearance = 0.04 if ultra_low_pick else 0.11
+            pregrasp_clearance = 0.05 if ultra_low_pick else 0.07
+            lateral_clearance = 0.08 if ultra_low_pick else 0.12
             pick_sides_and_objects = (
                 (("right", 1), ("left", 3))
                 if is_dual_pick
@@ -3923,18 +4150,20 @@ class RobotDemo(Demo):
                 )
                 active_lateral = right_lateral if pick_hand_side == "right" else -right_lateral
                 object_position = pick_object_positions[object_index]
-                grasp_target = object_position + approach_clearance * outward_normal + np.array([0.0, -0.025, 0.0])
+                grasp_target = object_position + approach_clearance * outward_normal + np.array(
+                    [0.0, -0.005 if ultra_low_pick else -0.025, 0.0]
+                )
                 pregrasp_target = (
                     grasp_target
                     + pregrasp_clearance * outward_normal
                     + lateral_clearance * active_lateral
-                    + np.array([0.0, 0.05, 0.0])
+                    + np.array([0.0, 0.025 if ultra_low_pick else 0.05, 0.0])
                 )
                 diagonal_approach_target = (
                     grasp_target
                     + 0.5 * pregrasp_clearance * outward_normal
                     + 0.5 * lateral_clearance * active_lateral
-                    + np.array([0.0, 0.025, 0.0])
+                    + np.array([0.0, 0.012 if ultra_low_pick else 0.025, 0.0])
                 )
                 lift_target = grasp_target + np.array([0.0, 0.05, 0.0])
                 chest_target = (
@@ -3943,17 +4172,20 @@ class RobotDemo(Demo):
                     + 0.18 * active_lateral
                     + np.array([0.0, -0.10, 0.0])
                 )
+                hand_waypoints = [
+                    (0, last_positions_world[hand_root_index]),
+                    (pregrasp_frame, pregrasp_target),
+                    (approach_frame, diagonal_approach_target),
+                    (grasp_frame, grasp_target),
+                    (lift_frame, lift_target),
+                    (chest_frame, chest_target),
+                    (total_frames - 1, chest_target),
+                ]
+                if reach_start_frame > 0:
+                    hand_waypoints.insert(1, (reach_start_frame, last_positions_world[hand_root_index]))
                 hand_target_path = _smooth_waypoint_path(
                     total_frames,
-                    [
-                        (0, last_positions_world[hand_root_index]),
-                        (pregrasp_frame, pregrasp_target),
-                        (approach_frame, diagonal_approach_target),
-                        (grasp_frame, grasp_target),
-                        (lift_frame, lift_target),
-                        (chest_frame, chest_target),
-                        (total_frames - 1, chest_target),
-                    ],
+                    hand_waypoints,
                 )
                 base_finger_direction = (
                     last_positions_world[middle_index] - last_positions_world[hand_root_index]
@@ -3978,25 +4210,25 @@ class RobotDemo(Demo):
                     [0.0, -1.0 if pick_hand_side == "left" else 1.0, 0.0],
                     dtype=np.float64,
                 )
-                target_palm_normals = _smooth_waypoint_path(
-                    total_frames,
-                    [
-                        (0, base_palm_normal_world),
-                        (pregrasp_frame, desired_palm_normal_world),
-                        (approach_frame, desired_palm_normal_world),
-                        (grasp_frame, desired_palm_normal_world),
-                        (lift_frame, desired_palm_normal_world),
-                        (chest_frame, desired_palm_normal_world),
-                        (total_frames - 1, desired_palm_normal_world),
-                    ],
-                )
+                palm_waypoints = [
+                    (0, base_palm_normal_world),
+                    (pregrasp_frame, desired_palm_normal_world),
+                    (approach_frame, desired_palm_normal_world),
+                    (grasp_frame, desired_palm_normal_world),
+                    (lift_frame, desired_palm_normal_world),
+                    (chest_frame, desired_palm_normal_world),
+                    (total_frames - 1, desired_palm_normal_world),
+                ]
+                if reach_start_frame > 0:
+                    palm_waypoints.insert(1, (reach_start_frame, base_palm_normal_world))
+                target_palm_normals = _smooth_waypoint_path(total_frames, palm_waypoints)
                 target_palm_norms = np.linalg.norm(target_palm_normals, axis=1, keepdims=True)
                 target_palm_normals = target_palm_normals / np.maximum(target_palm_norms, 1e-9)
                 rack_center = np.asarray(RACK_MAP_POSITIONS[pick_rack], dtype=np.float64)
                 front_clearance = (hand_target_path - rack_center[None, :]) @ outward_normal
                 minimum_front_clearance = float(RACK_WIDTH_M / 2.0 + 0.045)
                 actual_front_clearance = float(front_clearance.min())
-                if actual_front_clearance < minimum_front_clearance:
+                if actual_front_clearance < minimum_front_clearance and not ultra_low_pick:
                     raise RuntimeError(
                         "The planned hand path does not clear the shelf front by 4.5 cm "
                         f"(needed {minimum_front_clearance:.3f} m from rack center, "
@@ -4025,6 +4257,7 @@ class RobotDemo(Demo):
                     "chest_target": chest_target,
                     "active_lateral": active_lateral,
                     "correction_start_frame": pregrasp_frame,
+                    "lower_end_frame": lower_end_frame,
                 }
             primary_side = "right" if "right" in pick_specs else next(iter(pick_specs))
             primary_spec = pick_specs[primary_side]
@@ -4040,6 +4273,7 @@ class RobotDemo(Demo):
             model_pick_palm_normal_local = primary_spec["palm_normal_local"]
             model_pick_target_palm_normals = primary_spec["target_palm_normals"]
             model_pick_target_hand_rotations = None
+            model_pick_lower_end_frame = int(primary_spec.get("lower_end_frame", 0))
             model_dual_pick_specs = pick_specs if is_dual_pick else None
             if not is_dual_pick and workflow.pick_grasp_verified:
                 model_pick_existing_objects_by_hand = dict(workflow.picked_rack_objects_by_hand)
@@ -4085,15 +4319,16 @@ class RobotDemo(Demo):
                 right_hand_start_position=last_positions_world[int(primary_spec["hand_root_index"])],
                 hand_specs=pick_specs,
             )
-            end_effector_constraint.add_interval(
-                f"auto_{pick_rack}_object_{object_index}_pick_limbs",
-                0,
-                total_frames - 1,
-                hand_positions,
-                hand_rotations,
-                ["LeftHand", "LeftFoot", "RightFoot", "RightHand"],
-                {"left-hand", "left-foot", "right-foot", "right-hand"},
-            )
+            if not ultra_low_pick and target_hip_height_m is None:
+                end_effector_constraint.add_interval(
+                    f"auto_{pick_rack}_object_{object_index}_pick_limbs",
+                    0,
+                    total_frames - 1,
+                    hand_positions,
+                    hand_rotations,
+                    ["LeftHand", "LeftFoot", "RightFoot", "RightHand"],
+                    {"left-hand", "left-foot", "right-foot", "right-hand"},
+                )
 
             session.first_heading_angle = rack_facing_heading
             session.constrained_root_heading_angle = None
@@ -5299,6 +5534,7 @@ class RobotDemo(Demo):
                             "palm_normal_local": model_pick_palm_normal_local,
                             "target_palm_normals": model_pick_target_palm_normals,
                             "elbow_bend_hint": workflow.pick_elbow_bend_hint_world,
+                            "lower_end_frame": model_pick_lower_end_frame,
                         }
                     }
                     _freeze_body_except_right_arm(
@@ -5314,6 +5550,52 @@ class RobotDemo(Demo):
                         base_positions[motion.skeleton.root_idx],
                         set(active_specs.keys()),
                     )
+                active_lower_end_frame = max(
+                    int(spec.get("lower_end_frame", 0))
+                    for spec in active_specs.values()
+                )
+                _apply_low_pick_squat_pose(
+                    motion,
+                    base_rotations,
+                    base_positions,
+                    base_positions[motion.skeleton.root_idx],
+                    set(active_specs.keys()),
+                    target_height_m,
+                    target_hip_height_m,
+                    active_lower_end_frame,
+                    np.array(
+                        [np.sin(rack_facing_heading), 0.0, np.cos(rack_facing_heading)],
+                        dtype=np.float64,
+                    ),
+                )
+                if (target_height_m is not None and float(target_height_m) <= 0.12) or (
+                    target_hip_height_m is not None
+                ):
+                    workflow.picked_rack_object = None
+                    workflow.picked_rack_objects_by_hand.clear()
+                    workflow.pick_object_hand_offset = None
+                    workflow.pick_object_hand_offsets_by_side.clear()
+                    workflow.pick_hold_start_frame = None
+                    workflow.pick_hold_start_frames_by_side.clear()
+                    workflow.pick_grasp_verified = False
+                    motion.precompute_mesh_info()
+                    self.set_frame(client.client_id, 0)
+                    if target_hip_height_m is not None:
+                        title = "Hip-height motion generated"
+                        body = (
+                            f"Hip target set to {float(target_hip_height_m) * 100.0:.0f} cm. "
+                            "Hand constraints and object attachment are skipped for this trial."
+                        )
+                    else:
+                        title = "Ultra-low hip drop generated"
+                        body = "Hand constraints and object attachment are skipped for this trial."
+                    client.add_notification(
+                        title=title,
+                        body=body,
+                        auto_close_seconds=7.0,
+                        color="yellow",
+                    )
+                    return
 
                 grasp_frame = workflow.pick_hold_start_frame
                 chest_index = motion.skeleton.bone_order_names.index("Chest")
@@ -5386,7 +5668,8 @@ class RobotDemo(Demo):
                         "correction_start": correction_start,
                     }
 
-                correction_passes = 4 if model_dual_pick_specs is not None else 2
+                runtime_ultra_low_pick = target_height_m is not None and float(target_height_m) <= 0.12
+                correction_passes = 8 if runtime_ultra_low_pick else (4 if model_dual_pick_specs is not None else 2)
                 for _ in range(correction_passes):
                     all_close = True
                     for side, runtime in side_runtime.items():
@@ -5479,11 +5762,31 @@ class RobotDemo(Demo):
                 # The selectable rack objects are 6 cm cubes. A 6.5 cm palm-center
                 # tolerance still keeps the gripper on/near the object volume while
                 # avoiding false failures from tiny wrist/retarget offsets.
-                palm_grasp_tolerance = 0.065
+                palm_grasp_tolerance = 0.075 if runtime_ultra_low_pick else 0.065
+                max_chest_hold_error = 0.18 if runtime_ultra_low_pick else 0.08
                 workflow.pick_grasp_verified = (
                     palm_error <= palm_grasp_tolerance and body_clearance >= 0.16
                 )
-                if not workflow.pick_grasp_verified or final_error > 0.08:
+                if not workflow.pick_grasp_verified or final_error > max_chest_hold_error:
+                    if runtime_ultra_low_pick:
+                        workflow.picked_rack_object = None
+                        workflow.picked_rack_objects_by_hand.clear()
+                        workflow.pick_object_hand_offset = None
+                        workflow.pick_object_hand_offsets_by_side.clear()
+                        workflow.pick_hold_start_frame = None
+                        workflow.pick_hold_start_frames_by_side.clear()
+                        workflow.pick_grasp_verified = False
+                        self.set_frame(client.client_id, 0)
+                        client.add_notification(
+                            title="Ultra-low reach generated without attach",
+                            body=(
+                                f"Palm ended {palm_error * 100.0:.1f} cm from the object. "
+                                "Kept the crouch/reach motion and skipped object attachment."
+                            ),
+                            auto_close_seconds=7.0,
+                            color="yellow",
+                        )
+                        return
                     per_hand_text = ", ".join(
                         f"{side} {error:.3f} m" for side, error in sorted(per_hand_errors.items())
                     )
@@ -6519,6 +6822,7 @@ class RobotDemo(Demo):
                     visual_yaw_offset_rad=0.0,
                     initial_start_pose=start_pose,
                     mirror_wheel_z_axis=True,
+                    auto_lift_from_human_height=True,
                 )
             else:
                 workflow.t3_motion.visual_yaw_offset_rad = 0.0
@@ -6532,6 +6836,7 @@ class RobotDemo(Demo):
                 )
             workflow.freeze_t3_base = False
             workflow.t3_motion.set_base_frozen(False)
+            workflow.t3_motion.set_auto_lift_from_human_height(not workflow.t3_motion.has_csv_lift)
             workflow.t3_motion.apply_frame(0)
 
             show_t2_checkbox.value = False

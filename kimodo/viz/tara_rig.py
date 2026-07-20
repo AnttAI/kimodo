@@ -43,6 +43,7 @@ _TARA_CSV_JOINT_NAME_MAP = {
     "waist_pitch_joint_dof": "waist_pitch_joint",
     "head_pitch_joint_dof": "head_pitch_joint",
     "head_yaw_joint_dof": "head_yaw_joint",
+    "telescopic_lift_joint_dof": "telescopic_lift_joint",
     "right_joint1_dof": "right_joint1",
     "right_joint2_dof": "right_joint2",
     "right_joint3_dof": "right_joint3",
@@ -75,6 +76,10 @@ _TARA_CSV_JOINT_NAME_MAP = {
     "right_ankle_pitch_joint_dof": "right_ankle_pitch_joint",
 }
 
+_TARA_LINEAR_JOINT_NAMES = {
+    "telescopic_lift_joint",
+}
+
 # Optional non-joint columns appended by the combined T3 export.  These drive
 # the wheel-base viewer/hardware and must not be interpreted as joint angles.
 _TARA_CSV_METADATA_COLUMNS = {
@@ -100,6 +105,7 @@ _TARA_CSV_TO_URDF_JOINT_NAME_MAP = {
     "waist_pitch_joint": "waist_pitch_joint",
     "head_pitch_joint": "head_pitch_joint",
     "head_yaw_joint": "head_yaw_joint",
+    "telescopic_lift_joint": "telescopic_lift_joint",
     "right_joint1": "right_joint1",
     "right_joint2": "right_joint2",
     "right_joint3": "right_joint3",
@@ -214,11 +220,15 @@ def load_tara_motion_csv(path: str | Path, x_offset: float = 0.0) -> TaraMotionD
     root_positions *= TARA_MODEL_SCALE
     root_positions[:, 0] += x_offset
 
-    joint_angles = {
-        _TARA_CSV_JOINT_NAME_MAP[column_name]: np.deg2rad(csv_data[:, column_idx]).astype(np.float64)
-        for column_idx, column_name in enumerate(header[7:], start=7)
-        if column_name in _TARA_CSV_JOINT_NAME_MAP
-    }
+    joint_angles = {}
+    for column_idx, column_name in enumerate(header[7:], start=7):
+        joint_name = _TARA_CSV_JOINT_NAME_MAP.get(column_name)
+        if joint_name is None:
+            continue
+        values = csv_data[:, column_idx].astype(np.float64)
+        if joint_name not in _TARA_LINEAR_JOINT_NAMES:
+            values = np.deg2rad(values)
+        joint_angles[joint_name] = values
     return TaraMotionData(root_positions=root_positions, root_rotations=root_rotations, joint_angles=joint_angles)
 
 

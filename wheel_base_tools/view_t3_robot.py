@@ -28,6 +28,11 @@ from wheel_base_tools.view_two_wheel_base_tara_send import _read_diff_drive_csv
 DEFAULT_T3_URDF_PATH = REPO_ROOT / "robot_demo_outputs" / "t3_robot" / "T3.urdf"
 DEFAULT_T2_CSV_ROOT = Path("/home/jony/Downloads/soma-retargeter/assets/motions/t2_csv")
 DEFAULT_WHEEL_CSV_ROOT = REPO_ROOT / "robot_demo_outputs" / "wheel_base_robot"
+TELESCOPIC_LIFT_JOINT_NAME = "telescopic_lift_joint"
+TELESCOPIC_LIFT_MIN_M = 0.0
+TELESCOPIC_LIFT_MAX_M = 0.55
+T3_WAIST_HEIGHT_NO_LIFT_M = 0.795
+T3_SHOULDER_HEIGHT_NO_LIFT_M = 1.15289
 
 WHEEL_Z_UP_TO_SCENE_Y_UP = Rotation.from_euler("x", -90.0, degrees=True)
 T3_STIFF_POSTURE_JOINTS = {
@@ -71,6 +76,8 @@ class T3Playback:
         visual_yaw_offset_rad: float = 0.0,
         initial_start_pose: tuple[float, float, float] | None = None,
         mirror_wheel_z_axis: bool = False,
+        lift_extension_m: float | None = None,
+        auto_lift_from_human_height: bool = False,
     ):
         self.server = server
         self.urdf_path = urdf_path
@@ -83,6 +90,12 @@ class T3Playback:
         )
         self.visual_yaw_offset_rad = float(visual_yaw_offset_rad)
         self.mirror_wheel_z_axis = bool(mirror_wheel_z_axis)
+        self.lift_extension_m = (
+            None
+            if lift_extension_m is None
+            else float(np.clip(lift_extension_m, TELESCOPIC_LIFT_MIN_M, TELESCOPIC_LIFT_MAX_M))
+        )
+        self.auto_lift_from_human_height = bool(auto_lift_from_human_height)
         self.root_frame = server.scene.add_frame(root_node_name, show_axes=False)
         self.robot = ViserUrdf(
             server,
@@ -102,6 +115,7 @@ class T3Playback:
             if t2_csv_path is not None
             else None
         )
+        self.has_csv_lift = self._motion_has_csv_lift(self.t2_motion)
         self.wheel_motion = _read_diff_drive_csv(wheel_csv_path, fps)
         self._apply_wheel_frame_transform()
         self.base_frozen = False
@@ -139,6 +153,7 @@ class T3Playback:
             if t2_csv_path is not None
             else None
         )
+        self.has_csv_lift = self._motion_has_csv_lift(self.t2_motion)
         self.wheel_motion = _read_diff_drive_csv(wheel_csv_path, fps)
         self._apply_wheel_frame_transform()
         if start_pose is not None:
@@ -202,10 +217,44 @@ class T3Playback:
             self.cfg[left_idx] = math.remainder(self.wheel_motion["left_angle"][base_frame_idx], 2.0 * math.pi)
         if right_idx is not None:
             self.cfg[right_idx] = math.remainder(self.wheel_motion["right_angle"][base_frame_idx], 2.0 * math.pi)
+        lift_idx = self.joint_index.get(TELESCOPIC_LIFT_JOINT_NAME)
+        if lift_idx is not None:
+            lift_extension_m = self._lift_extension_for_frame(frame_idx)
+            if lift_extension_m is not None:
+                self.cfg[lift_idx] = lift_extension_m
         self.robot.update_cfg(self.cfg)
+
+    @staticmethod
+    def _motion_has_csv_lift(t2_motion) -> bool:
+        return t2_motion is not None and TELESCOPIC_LIFT_JOINT_NAME in t2_motion.joint_angles
+
+    def _lift_extension_for_frame(self, frame_idx: int) -> float | None:
+        if self.has_csv_lift and self.lift_extension_m is None:
+            return None
+        if self.auto_lift_from_human_height and self.t2_motion is not None and self.t2_motion.length > 0:
+            t2_frame_idx = min(frame_idx, self.t2_motion.length - 1)
+            human_waist_height_m = float(self.t2_motion.root_positions[t2_frame_idx, 1])
+            return float(np.clip(
+                human_waist_height_m - T3_WAIST_HEIGHT_NO_LIFT_M,
+                TELESCOPIC_LIFT_MIN_M,
+                TELESCOPIC_LIFT_MAX_M,
+            ))
+        return self.lift_extension_m
 
     def set_base_frozen(self, frozen: bool) -> None:
         self.base_frozen = bool(frozen)
+        self.apply_frame(self.frame_idx)
+
+    def set_lift_extension(self, extension_m: float | None) -> None:
+        self.lift_extension_m = (
+            None
+            if extension_m is None
+            else float(np.clip(extension_m, TELESCOPIC_LIFT_MIN_M, TELESCOPIC_LIFT_MAX_M))
+        )
+        self.apply_frame(self.frame_idx)
+
+    def set_auto_lift_from_human_height(self, enabled: bool) -> None:
+        self.auto_lift_from_human_height = bool(enabled)
         self.apply_frame(self.frame_idx)
 
     def set_visible(self, visible: bool) -> None:
@@ -224,6 +273,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--fps", type=float, default=30.0, help="CSV frame rate in Hz. Default: 30.")
     parser.add_argument("--host", default="0.0.0.0", help="Viser host. Default: 0.0.0.0.")
     parser.add_argument("--port", type=int, default=8092, help="Viser port. Default: 8092.")
+    parser.add_argument(
+        "--lift-extension-m",
+        type=float,
+        default=None,
+        help="Manual telescopic lift extension in meters. Range: 0.0 to 0.55. Default: match human waist at frame 0.",
+    )
+    parser.add_argument(
+        "--manual-lift",
+        action="store_true",
+        help="Use the manual lift extension instead of following the human waist height.",
+    )
     parser.add_argument(
         "--follow-t2-posture",
         action="store_true",
@@ -278,7 +338,36 @@ def main() -> None:
         client.camera.up_direction = np.array([0.0, 1.0, 0.0], dtype=np.float64)
         client.camera.fov = np.deg2rad(45.0)
 
-    t3 = T3Playback(server, t3_urdf_path, t2_csv, wheel_csv, args.fps, stiff_posture=not args.follow_t2_posture)
+    t3_t2_motion = _tara_rig.load_tara_motion_csv(t2_csv)
+    csv_has_lift = T3Playback._motion_has_csv_lift(t3_t2_motion)
+    if args.lift_extension_m is None and csv_has_lift:
+        initial_lift_extension_m = None
+        initial_lift_slider_m = float(np.clip(
+            t3_t2_motion.joint_angles[TELESCOPIC_LIFT_JOINT_NAME][0],
+            TELESCOPIC_LIFT_MIN_M,
+            TELESCOPIC_LIFT_MAX_M,
+        ))
+    elif args.lift_extension_m is None:
+        initial_human_waist_height_m = float(t3_t2_motion.root_positions[0, 1]) if t3_t2_motion.length > 0 else T3_WAIST_HEIGHT_NO_LIFT_M
+        initial_lift_extension_m = float(np.clip(
+            initial_human_waist_height_m - T3_WAIST_HEIGHT_NO_LIFT_M,
+            TELESCOPIC_LIFT_MIN_M,
+            TELESCOPIC_LIFT_MAX_M,
+        ))
+        initial_lift_slider_m = initial_lift_extension_m
+    else:
+        initial_lift_extension_m = float(np.clip(args.lift_extension_m, TELESCOPIC_LIFT_MIN_M, TELESCOPIC_LIFT_MAX_M))
+        initial_lift_slider_m = initial_lift_extension_m
+    t3 = T3Playback(
+        server,
+        t3_urdf_path,
+        t2_csv,
+        wheel_csv,
+        args.fps,
+        stiff_posture=not args.follow_t2_posture,
+        lift_extension_m=initial_lift_extension_m,
+        auto_lift_from_human_height=not args.manual_lift and not csv_has_lift,
+    )
     start_time = time.time()
 
     with server.gui.add_folder("T3 Robot"):
@@ -286,6 +375,14 @@ def main() -> None:
         play = server.gui.add_checkbox("Play T3", initial_value=False)
         loop = server.gui.add_checkbox("Loop T3", initial_value=True)
         freeze_base = server.gui.add_checkbox("Keep T3 Base Stationary", initial_value=False)
+        auto_lift = server.gui.add_checkbox("Auto Match Human Height", initial_value=not args.manual_lift and not csv_has_lift)
+        lift_extension = server.gui.add_slider(
+            "Lift extension (m)",
+            min=TELESCOPIC_LIFT_MIN_M,
+            max=TELESCOPIC_LIFT_MAX_M,
+            step=0.01,
+            initial_value=initial_lift_slider_m,
+        )
         speed = server.gui.add_slider("T3 speed", min=0.1, max=3.0, step=0.1, initial_value=1.0)
         frame = server.gui.add_slider("T3 frame", min=0, max=t3.length - 1, step=1, initial_value=0)
         reset = server.gui.add_button("Reset T3")
@@ -313,6 +410,21 @@ def main() -> None:
                 max_yaw_rate=12.0,
             )
         t3.load_csvs(t2_csv_now, wheel_csv_now, args.fps)
+        if args.lift_extension_m is None and t3.has_csv_lift and t3.t2_motion is not None:
+            lift_extension.value = float(np.clip(
+                t3.t2_motion.joint_angles[TELESCOPIC_LIFT_JOINT_NAME][0],
+                TELESCOPIC_LIFT_MIN_M,
+                TELESCOPIC_LIFT_MAX_M,
+            ))
+            t3.set_lift_extension(None)
+            t3.set_auto_lift_from_human_height(False)
+            auto_lift.value = False
+        elif args.lift_extension_m is None and t3.t2_motion is not None and t3.t2_motion.length > 0:
+            lift_extension.value = float(np.clip(
+                float(t3.t2_motion.root_positions[0, 1]) - T3_WAIST_HEIGHT_NO_LIFT_M,
+                TELESCOPIC_LIFT_MIN_M,
+                TELESCOPIC_LIFT_MAX_M,
+            ))
         frame.max = t3.length - 1
         frame.value = 0
         reset_clock(0)
@@ -320,6 +432,14 @@ def main() -> None:
     @freeze_base.on_update
     def _(_) -> None:
         t3.set_base_frozen(bool(freeze_base.value))
+
+    @auto_lift.on_update
+    def _(_) -> None:
+        t3.set_auto_lift_from_human_height(bool(auto_lift.value))
+
+    @lift_extension.on_update
+    def _(_) -> None:
+        t3.set_lift_extension(float(lift_extension.value))
 
     @frame.on_update
     def _(_) -> None:
